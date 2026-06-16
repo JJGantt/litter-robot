@@ -1,0 +1,5 @@
+.env-litter
+logs/
+__pycache__/
+*.pyc
+.git/
