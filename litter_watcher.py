@@ -29,6 +29,7 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
+import httpx
 from dotenv import load_dotenv
 from pylitterbot import Account
 from pylitterbot.event import EVENT_UPDATE
@@ -41,6 +42,15 @@ WEIGHT_THRESHOLD = float(os.environ.get("WEIGHT_THRESHOLD_LB", 3.0))
 RESET_CAP = int(os.environ.get("RESET_CAP", 15))
 LOG_DIR = Path(os.environ.get("LOG_DIR", BASE / "logs"))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+# Failsafe / alerting
+OFFLINE_ALERT_SECONDS = float(os.environ.get("OFFLINE_ALERT_SECONDS", 300))   # robot offline this long -> Telegram
+HEARTBEAT_SECONDS = float(os.environ.get("HEARTBEAT_SECONDS", 1800))          # ping healthchecks this often
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+HEALTHCHECKS_URL = os.environ.get("HEALTHCHECKS_URL", "")
+# A clean cycle was in progress when it dropped -> worth calling out in the alert.
+MID_CYCLE_STATES = {"CLEAN_CYCLE", "CAT_SENSOR_INTERRUPTED", "PAUSED"}
 
 STUCK_STATES = {"CAT_SENSOR_INTERRUPTED", "PAUSED"}
 HEALTHY_STATES = {"CLEAN_CYCLE", "READY", "CLEAN_CYCLE_COMPLETE", "CAT_SENSOR_TIMING", "OFF"}
@@ -74,6 +84,31 @@ def snapshot(robot) -> dict:
     }
 
 
+async def send_telegram(text: str) -> None:
+    """Best-effort Telegram message via the @jaredpi_bot. Never raises."""
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+            )
+    except Exception as ex:
+        log_event("telegram_error", error=str(ex))
+
+
+async def heartbeat() -> None:
+    """Best-effort ping to the healthchecks.io dead-man's switch. Never raises."""
+    if not HEALTHCHECKS_URL:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.get(HEALTHCHECKS_URL)
+    except Exception as ex:
+        log_event("heartbeat_error", error=str(ex))
+
+
 class Watcher:
     def __init__(self, robot):
         self.robot = robot
@@ -81,6 +116,10 @@ class Watcher:
         self.last_status = None
         self.incident_resets = 0
         self.capped = False
+        # offline-failsafe state
+        self.offline_since = None
+        self.offline_alerted = False
+        self.last_online_status = None
 
     async def evaluate(self) -> None:
         # Single-flight: if an evaluation/reset is already in progress, skip;
@@ -95,8 +134,25 @@ class Watcher:
                 log_event("status", **snap)
                 self.last_status = status
 
+            # --- Offline failsafe (Mode A): alert if the robot is unreachable ---
+            now = asyncio.get_event_loop().time()
             if not snap["online"]:
+                if self.offline_since is None:
+                    self.offline_since = now
+                elif not self.offline_alerted and (now - self.offline_since) >= OFFLINE_ALERT_SECONDS:
+                    mins = int(OFFLINE_ALERT_SECONDS // 60)
+                    mid = " It was mid-cycle when it dropped." if self.last_online_status in MID_CYCLE_STATES else ""
+                    log_event("offline_alert", last_online_status=self.last_online_status, **snap)
+                    await send_telegram(f"⚠️ Litter-Robot offline for {mins}+ min — can't reach status.{mid}")
+                    self.offline_alerted = True
                 return
+            else:
+                if self.offline_alerted:
+                    log_event("recovered_alert", **snap)
+                    await send_telegram("✅ Litter-Robot back online.")
+                self.offline_since = None
+                self.offline_alerted = False
+                self.last_online_status = status
 
             if status in STUCK_STATES:
                 w = snap.get("weight") or 0
@@ -139,11 +195,18 @@ async def run_once() -> None:
         robot.on(EVENT_UPDATE, watcher.on_update)
         await robot.subscribe()
         await watcher.evaluate()  # act on current state immediately
+        await heartbeat()         # initial "I'm alive" ping to the dead-man's switch
+        last_hb = asyncio.get_event_loop().time()
         # Backstop loop: periodic refresh emits EVENT_UPDATE -> evaluate(),
         # guaranteeing action even if a websocket push is missed/dropped.
+        # Also emits the heartbeat ping so an external monitor catches a dead watcher.
         while True:
             await asyncio.sleep(BACKSTOP)
             await robot.refresh()
+            now = asyncio.get_event_loop().time()
+            if now - last_hb >= HEARTBEAT_SECONDS:
+                await heartbeat()
+                last_hb = now
     finally:
         try:
             await account.disconnect()
