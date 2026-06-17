@@ -32,6 +32,7 @@ Config (env, with defaults):
 import asyncio
 import json
 import os
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -55,6 +56,13 @@ HEARTBEAT_SECONDS = float(os.environ.get("HEARTBEAT_SECONDS", 1800))          # 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 HEALTHCHECKS_URL = os.environ.get("HEALTHCHECKS_URL", "")
+
+# Closet status light (Govee) — driven over the cloud API so the Fly watcher can reach it.
+GOVEE_API_KEY = os.environ.get("GOVEE_API_KEY", "")
+GOVEE_LIGHT_SKU = os.environ.get("GOVEE_LIGHT_SKU", "")
+GOVEE_LIGHT_DEVICE = os.environ.get("GOVEE_LIGHT_DEVICE", "")
+LIGHT_RGB = {"yellow": (255, 200, 0), "orange": (255, 80, 0)}
+
 # A clean cycle was in progress when it dropped -> worth calling out in the alert.
 MID_CYCLE_STATES = {"CLEAN_CYCLE", "CAT_SENSOR_INTERRUPTED", "PAUSED"}
 
@@ -117,12 +125,43 @@ async def heartbeat() -> None:
         log_event("heartbeat_error", error=str(ex))
 
 
+async def set_closet_light(desired: str) -> None:
+    """Set the closet status light via Govee cloud. desired: 'off' | 'yellow' | 'orange'. Never raises."""
+    if not (GOVEE_API_KEY and GOVEE_LIGHT_SKU and GOVEE_LIGHT_DEVICE):
+        return
+
+    async def _ctrl(cap_type: str, instance: str, value) -> None:
+        payload = {
+            "requestId": str(uuid.uuid4()),
+            "payload": {"sku": GOVEE_LIGHT_SKU, "device": GOVEE_LIGHT_DEVICE,
+                        "capability": {"type": cap_type, "instance": instance, "value": value}},
+        }
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(
+                "https://openapi.api.govee.com/router/api/v1/device/control",
+                headers={"Govee-API-Key": GOVEE_API_KEY, "Content-Type": "application/json"},
+                json=payload,
+            )
+
+    try:
+        if desired == "off":
+            await _ctrl("devices.capabilities.on_off", "powerSwitch", 0)
+        else:
+            r, g, b = LIGHT_RGB[desired]
+            await _ctrl("devices.capabilities.on_off", "powerSwitch", 1)
+            await _ctrl("devices.capabilities.color_setting", "colorRgb", (r << 16) | (g << 8) | b)
+        log_event("light", state=desired)
+    except Exception as ex:
+        log_event("light_error", error=str(ex), desired=desired)
+
+
 class Watcher:
     def __init__(self, robot):
         self.robot = robot
         self.lock = asyncio.Lock()
         self.last_status = None
         self.was_stuck = False  # for edge-triggered reset
+        self.last_light = None  # closet status light state
         # offline-failsafe state
         self.offline_since = None
         self.offline_alerted = False
@@ -140,6 +179,14 @@ class Watcher:
             if status != self.last_status:
                 log_event("status", **snap)
                 self.last_status = status
+
+            # Closet status light: yellow while cycling, orange while stuck, off otherwise.
+            desired_light = ("yellow" if status == "CLEAN_CYCLE"
+                             else "orange" if status in STUCK_STATES
+                             else "off")
+            if desired_light != self.last_light:
+                await set_closet_light(desired_light)
+                self.last_light = desired_light
 
             # --- Offline failsafe (Mode A): alert if the robot is unreachable ---
             now = asyncio.get_event_loop().time()
