@@ -34,6 +34,26 @@ from dotenv import load_dotenv
 from pylitterbot import Account
 from pylitterbot.event import EVENT_UPDATE
 
+# --- Fix pylitterbot's LR4 realtime websocket ---
+# pylitterbot opens the AWS AppSync websocket but never sends the `connection_init`
+# handshake, so AppSync never returns connection_ack/start_ack and the subscription
+# silently delivers ZERO pushes (everything falls back to polling). Injecting
+# connection_init into the WS config makes the monitor send it before subscribing,
+# which completes the handshake and turns on real-time updates.
+try:
+    from pylitterbot.robot.litterrobot4 import LitterRobot4
+    _LR4_PROTO = LitterRobot4._WS_PROTOCOL
+    _orig_ws_config_factory = _LR4_PROTO.ws_config_factory
+
+    async def _ws_config_factory_with_init(robot):
+        cfg = await _orig_ws_config_factory(robot)
+        cfg["connection_init"] = {"type": "connection_init"}
+        return cfg
+
+    _LR4_PROTO.ws_config_factory = _ws_config_factory_with_init
+except Exception:  # never let the patch break startup
+    pass
+
 BASE = Path(__file__).parent
 load_dotenv(BASE / ".env-litter")
 
