@@ -57,6 +57,10 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 HEALTHCHECKS_URL = os.environ.get("HEALTHCHECKS_URL", "")
 
+# Publish robot status to Supabase (device_status table) for the status hub to read.
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+
 # Closet status light (Govee) — driven over the cloud API so the Fly watcher can reach it.
 GOVEE_API_KEY = os.environ.get("GOVEE_API_KEY", "")
 GOVEE_LIGHT_SKU = os.environ.get("GOVEE_LIGHT_SKU", "")
@@ -132,6 +136,29 @@ async def heartbeat() -> None:
             await client.get(HEALTHCHECKS_URL)
     except Exception as ex:
         log_event("heartbeat_error", error=str(ex))
+
+
+async def publish_status(serial: str, snap: dict) -> None:
+    """Upsert the robot's current status to Supabase (device_status) for the hub. Never raises."""
+    if not (SUPABASE_URL and SUPABASE_KEY):
+        return
+    litter = snap.get("litterPct")
+    litter_pct = round(litter * 100, 1) if isinstance(litter, (int, float)) and litter <= 1.5 else litter
+    row = {
+        "device": serial, "name": "Litter-Robot 4", "status": snap.get("status"),
+        "litter_level_pct": litter_pct, "waste_drawer_pct": snap.get("drawerPct"),
+        "online": snap.get("online"), "updated_at": now_iso(),
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(
+                f"{SUPABASE_URL}/rest/v1/device_status?on_conflict=device",
+                headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                         "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates"},
+                json=row,
+            )
+    except Exception as ex:
+        log_event("publish_error", error=str(ex))
 
 
 def _govee_ready() -> bool:
@@ -265,6 +292,7 @@ class Watcher:
             if status != self.last_status:
                 log_event("status", **snap)
                 self.last_status = status
+                await publish_status(self.robot.serial, snap)
 
             # Closet status light. The watcher only "takes over" when there's something to
             # show; otherwise it hands the light back to whatever state the user left it in.
@@ -387,6 +415,7 @@ async def run_once() -> None:
 
             if now - last_hb >= HEARTBEAT_SECONDS:
                 await heartbeat()
+                await publish_status(robot.serial, snapshot(robot))  # keep device_status fresh
                 last_hb = now
 
             await asyncio.sleep(interval)
