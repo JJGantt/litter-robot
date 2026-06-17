@@ -61,10 +61,16 @@ HEALTHCHECKS_URL = os.environ.get("HEALTHCHECKS_URL", "")
 GOVEE_API_KEY = os.environ.get("GOVEE_API_KEY", "")
 GOVEE_LIGHT_SKU = os.environ.get("GOVEE_LIGHT_SKU", "")
 GOVEE_LIGHT_DEVICE = os.environ.get("GOVEE_LIGHT_DEVICE", "")
-# Status -> override color. Placeholders for now; swap "full"/"offline" for a Govee
-# dynamic-scene trigger later (just change set_closet_light / the override mapping).
-LIGHT_RGB = {"yellow": (255, 200, 0), "orange": (255, 80, 0), "red": (255, 0, 0)}
 DRAWER_FULL_PCT = float(os.environ.get("DRAWER_FULL_PCT", 90))  # drawerPct >= this -> "needs emptying"
+
+# Status -> Govee DIY scene NAME (authored in the Govee app; edit their look there freely).
+# Scene IDs are resolved from these names at startup, so editing a scene's appearance keeps
+# working; only renaming or deleting+recreating a scene needs a watcher restart to re-resolve.
+SCENE_CYCLING = "Cycling"
+SCENE_STUCK = "Stuck"
+SCENE_FULL = "Drawer full"
+SCENE_OFFLINE = "Disconnected"
+_DIY_SCENES: dict = {}  # scene name -> id, populated at startup by load_diy_scenes()
 
 # A clean cycle was in progress when it dropped -> worth calling out in the alert.
 MID_CYCLE_STATES = {"CLEAN_CYCLE", "CAT_SENSOR_INTERRUPTED", "PAUSED"}
@@ -146,17 +152,43 @@ async def _govee_ctrl(cap_type: str, instance: str, value) -> None:
         )
 
 
-async def set_closet_light(color: str) -> None:
-    """Override the closet light to a named status color (powers on + sets RGB). Never raises."""
+async def load_diy_scenes() -> None:
+    """Resolve DIY scene NAME -> id from the device, so we can trigger scenes by name."""
     if not _govee_ready():
         return
     try:
-        r, g, b = LIGHT_RGB[color]
-        await _govee_ctrl("devices.capabilities.on_off", "powerSwitch", 1)
-        await _govee_ctrl("devices.capabilities.color_setting", "colorRgb", (r << 16) | (g << 8) | b)
-        log_event("light", state=color)
+        payload = {"requestId": str(uuid.uuid4()),
+                   "payload": {"sku": GOVEE_LIGHT_SKU, "device": GOVEE_LIGHT_DEVICE}}
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                "https://openapi.api.govee.com/router/api/v1/device/diy-scenes",
+                headers={"Govee-API-Key": GOVEE_API_KEY, "Content-Type": "application/json"},
+                json=payload,
+            )
+        _DIY_SCENES.clear()
+        for c in resp.json().get("payload", {}).get("capabilities", []):
+            if c.get("instance") == "diyScene":
+                for o in c.get("parameters", {}).get("options", []):
+                    _DIY_SCENES[o["name"]] = o["value"]
+        log_event("diy_scenes_loaded", scenes=_DIY_SCENES)
     except Exception as ex:
-        log_event("light_error", error=str(ex), color=color)
+        log_event("diy_scenes_error", error=str(ex))
+
+
+async def set_closet_light(scene: str) -> None:
+    """Trigger a DIY scene on the closet light by name (powers on, then runs it). Never raises."""
+    if not _govee_ready():
+        return
+    sid = _DIY_SCENES.get(scene)
+    if sid is None:
+        log_event("scene_missing", scene=scene, known=list(_DIY_SCENES))
+        return
+    try:
+        await _govee_ctrl("devices.capabilities.on_off", "powerSwitch", 1)
+        await _govee_ctrl("devices.capabilities.dynamic_scene", "diyScene", sid)
+        log_event("light", scene=scene, id=sid)
+    except Exception as ex:
+        log_event("light_error", error=str(ex), scene=scene)
 
 
 async def get_light_state() -> "dict | None":
@@ -237,13 +269,13 @@ class Watcher:
             # Closet status light. The watcher only "takes over" when there's something to
             # show; otherwise it hands the light back to whatever state the user left it in.
             if not snap["online"]:
-                override = "red"                                   # disconnected (swap for a scene later)
+                override = SCENE_OFFLINE
             elif status == "CLEAN_CYCLE":
-                override = "yellow"
+                override = SCENE_CYCLING
             elif status in STUCK_STATES:
-                override = "orange"
+                override = SCENE_STUCK
             elif (snap.get("drawerPct") or 0) >= DRAWER_FULL_PCT:
-                override = "red"                                   # needs emptying (swap for a scene later)
+                override = SCENE_FULL
             else:
                 override = None                                    # nothing to show -> restore user's light
             await self.update_light(override)
@@ -322,6 +354,7 @@ async def run_once() -> None:
         watcher = Watcher(robot)
         log_event("startup", serial=robot.serial, slow_poll=SLOW_POLL,
                   fast_poll=FAST_POLL, weight_threshold=WEIGHT_THRESHOLD)
+        await load_diy_scenes()   # resolve scene names -> ids before we may trigger one
         await robot.refresh()
         await watcher.evaluate()  # act on current state immediately
         await heartbeat()         # initial "I'm alive" ping to the dead-man's switch
