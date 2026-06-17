@@ -1,23 +1,30 @@
 #!/usr/bin/env python3
 """Litter-Robot 4 auto-resume watcher.
 
-Holds a websocket subscription to the robot for instant reaction. When it gets
-stuck in a false CAT_SENSOR_INTERRUPTED / PAUSED state (weight sensor ~0, i.e.
-no cat present), it presses the reset button (shortResetPress) to resume the
-cycle. After each press the next push/refresh re-evaluates, so it naturally
-retries (and un-does an accidental toggle into PAUSE) until the cycle is moving
-again. A real cat (weight present) is never touched.
+The LR4 intermittently throws a false CAT_SENSOR_INTERRUPTED mid-cycle (weight
+sensor ~0, no cat present). This watcher detects it and presses the reset button
+(shortResetPress) to resume the cycle.
 
-Reliability: the websocket gives instant response, and a periodic backstop
-refresh guarantees it can never sit stuck even if a push is missed or the
-socket drops. On any connection failure it reconnects.
+Detection — adaptive polling (the device does NOT push state, confirmed by test):
+poll slowly while idle; the instant a poll sees a cycle running or stuck, ramp to
+fast polling so we can't miss a re-interruption; drop back to slow when the cycle
+ends. A safety cap stops fast-polling if a "cycle" somehow never completes.
 
-Logging: one JSON line per event to stdout (captured by `fly logs`) and to a
-daily file under LOG_DIR.
+Action — edge-triggered: press reset exactly ONCE on the transition INTO a stuck
+state, never again while it stays stuck (the robot takes ~10-15s to respond; re-
+pressing a toggle during that lag flips it back). A real cat (weight present) is
+never touched. The next interruption is a fresh edge -> its own single press.
+
+Failsafe: Telegram alert if the robot is unreachable; a healthchecks.io heartbeat
+so an external monitor catches a dead watcher. Reconnects on any failure.
+
+Logging: one JSON line per event to stdout (fly logs) and a daily file under LOG_DIR.
 
 Config (env, with defaults):
   LITTER_USER / LITTER_PASS  - Whisker account credentials (required)
-  BACKSTOP_SECONDS           - safety-net refresh interval (default 20)
+  SLOW_POLL_SECONDS          - idle baseline poll interval (default 20)
+  FAST_POLL_SECONDS          - poll interval while a cycle is active (default 1)
+  MAX_FAST_SECONDS           - safety cap: stop fast-polling after this long (default 600)
   WEIGHT_THRESHOLD_LB        - max weight treated as "no cat" (default 3.0)
   LOG_DIR                    - log directory (default ./logs)
 """
@@ -31,32 +38,13 @@ from pathlib import Path
 import httpx
 from dotenv import load_dotenv
 from pylitterbot import Account
-from pylitterbot.event import EVENT_UPDATE
-
-# --- Fix pylitterbot's LR4 realtime websocket ---
-# pylitterbot opens the AWS AppSync websocket but never sends the `connection_init`
-# handshake, so AppSync never returns connection_ack/start_ack and the subscription
-# silently delivers ZERO pushes (everything falls back to polling). Injecting
-# connection_init into the WS config makes the monitor send it before subscribing,
-# which completes the handshake and turns on real-time updates.
-try:
-    from pylitterbot.robot.litterrobot4 import LitterRobot4
-    _LR4_PROTO = LitterRobot4._WS_PROTOCOL
-    _orig_ws_config_factory = _LR4_PROTO.ws_config_factory
-
-    async def _ws_config_factory_with_init(robot):
-        cfg = await _orig_ws_config_factory(robot)
-        cfg["connection_init"] = {"type": "connection_init"}
-        return cfg
-
-    _LR4_PROTO.ws_config_factory = _ws_config_factory_with_init
-except Exception:  # never let the patch break startup
-    pass
 
 BASE = Path(__file__).parent
 load_dotenv(BASE / ".env-litter")
 
-BACKSTOP = float(os.environ.get("BACKSTOP_SECONDS", 20))
+SLOW_POLL = float(os.environ.get("SLOW_POLL_SECONDS", 20))   # idle baseline
+FAST_POLL = float(os.environ.get("FAST_POLL_SECONDS", 1))    # while a cycle is active
+MAX_FAST_SECONDS = float(os.environ.get("MAX_FAST_SECONDS", 600))  # cap on continuous fast-polling
 WEIGHT_THRESHOLD = float(os.environ.get("WEIGHT_THRESHOLD_LB", 3.0))
 LOG_DIR = Path(os.environ.get("LOG_DIR", BASE / "logs"))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -72,6 +60,8 @@ MID_CYCLE_STATES = {"CLEAN_CYCLE", "CAT_SENSOR_INTERRUPTED", "PAUSED"}
 
 STUCK_STATES = {"CAT_SENSOR_INTERRUPTED", "PAUSED"}
 HEALTHY_STATES = {"CLEAN_CYCLE", "READY", "CLEAN_CYCLE_COMPLETE", "CAT_SENSOR_TIMING", "OFF"}
+# A cycle is "active" (globe moving or stuck mid-cycle) -> poll fast to stay on top of it.
+ACTIVE_STATES = {"CLEAN_CYCLE", "CAT_SENSOR_INTERRUPTED", "PAUSED"}
 
 
 def now_iso() -> str:
@@ -191,10 +181,6 @@ class Watcher:
                 log_event("incident_cleared", **snap)
             self.was_stuck = is_stuck
 
-    def on_update(self) -> None:
-        # Sync callback from the event system -> schedule async evaluation.
-        asyncio.create_task(self.evaluate())
-
 
 async def run_once() -> None:
     account = Account()
@@ -206,23 +192,45 @@ async def run_once() -> None:
     try:
         robot = account.robots[0]
         watcher = Watcher(robot)
-        log_event("startup", serial=robot.serial, backstop=BACKSTOP,
-                  weight_threshold=WEIGHT_THRESHOLD)
-        robot.on(EVENT_UPDATE, watcher.on_update)
-        await robot.subscribe()
+        log_event("startup", serial=robot.serial, slow_poll=SLOW_POLL,
+                  fast_poll=FAST_POLL, weight_threshold=WEIGHT_THRESHOLD)
+        await robot.refresh()
         await watcher.evaluate()  # act on current state immediately
         await heartbeat()         # initial "I'm alive" ping to the dead-man's switch
         last_hb = asyncio.get_event_loop().time()
-        # Backstop loop: periodic refresh emits EVENT_UPDATE -> evaluate(),
-        # guaranteeing action even if a websocket push is missed/dropped.
-        # Also emits the heartbeat ping so an external monitor catches a dead watcher.
+
+        # Adaptive polling: slow while idle; ramp to fast the instant a cycle is
+        # active (running or stuck) so we never miss a re-interruption; drop back to
+        # slow when it ends. A safety cap stops fast-polling if a "cycle" never clears.
+        fast_since = None
+        fast_capped = False
         while True:
-            await asyncio.sleep(BACKSTOP)
-            await robot.refresh()
             now = asyncio.get_event_loop().time()
+            active = robot.status.name in ACTIVE_STATES
+            if active:
+                if fast_since is None:
+                    fast_since = now
+                    log_event("cycle_active", status=robot.status.name, poll=FAST_POLL)
+                if not fast_capped and (now - fast_since) >= MAX_FAST_SECONDS:
+                    fast_capped = True
+                    mins = int(MAX_FAST_SECONDS // 60)
+                    log_event("fast_poll_cap_reached", status=robot.status.name, minutes=mins)
+                    await send_telegram(f"⚠️ Litter-Robot cycle still active after {mins} min — please check it.")
+                interval = SLOW_POLL if fast_capped else FAST_POLL
+            else:
+                if fast_since is not None:
+                    log_event("cycle_done", status=robot.status.name)
+                fast_since = None
+                fast_capped = False
+                interval = SLOW_POLL
+
             if now - last_hb >= HEARTBEAT_SECONDS:
                 await heartbeat()
                 last_hb = now
+
+            await asyncio.sleep(interval)
+            await robot.refresh()
+            await watcher.evaluate()
     finally:
         try:
             await account.disconnect()

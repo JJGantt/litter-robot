@@ -5,7 +5,9 @@ primary_region = "iad"
 [build]
 
 [env]
-  BACKSTOP_SECONDS = "5"
+  SLOW_POLL_SECONDS = "20"
+  FAST_POLL_SECONDS = "1"
+  MAX_FAST_SECONDS = "600"
   WEIGHT_THRESHOLD_LB = "3.0"
 
 [[vm]]
