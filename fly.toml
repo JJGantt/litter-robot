@@ -5,7 +5,7 @@ primary_region = "iad"
 [build]
 
 [env]
-  BACKSTOP_SECONDS = "5"
+  BACKSTOP_SECONDS = "20"
   WEIGHT_THRESHOLD_LB = "3.0"
   RESET_CAP = "15"
 
