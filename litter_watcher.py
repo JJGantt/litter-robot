@@ -19,7 +19,6 @@ Config (env, with defaults):
   LITTER_USER / LITTER_PASS  - Whisker account credentials (required)
   BACKSTOP_SECONDS           - safety-net refresh interval (default 20)
   WEIGHT_THRESHOLD_LB        - max weight treated as "no cat" (default 3.0)
-  RESET_CAP                  - max presses per stuck incident (default 15)
   LOG_DIR                    - log directory (default ./logs)
 """
 
@@ -59,7 +58,6 @@ load_dotenv(BASE / ".env-litter")
 
 BACKSTOP = float(os.environ.get("BACKSTOP_SECONDS", 20))
 WEIGHT_THRESHOLD = float(os.environ.get("WEIGHT_THRESHOLD_LB", 3.0))
-RESET_CAP = int(os.environ.get("RESET_CAP", 15))
 LOG_DIR = Path(os.environ.get("LOG_DIR", BASE / "logs"))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -134,8 +132,7 @@ class Watcher:
         self.robot = robot
         self.lock = asyncio.Lock()
         self.last_status = None
-        self.incident_resets = 0
-        self.capped = False
+        self.was_stuck = False  # for edge-triggered reset
         # offline-failsafe state
         self.offline_since = None
         self.offline_alerted = False
@@ -174,26 +171,25 @@ class Watcher:
                 self.offline_alerted = False
                 self.last_online_status = status
 
-            if status in STUCK_STATES:
+            # Edge-triggered reset: press ONCE on the transition INTO a stuck state,
+            # then never again while it stays stuck. A single press resumes the cycle
+            # after the robot's ~10-15s response lag; re-pressing during that lag just
+            # toggles it back (that was the old oscillation). The next interruption is a
+            # fresh rising edge and gets its own single press. No timers, no cooldown.
+            is_stuck = status in STUCK_STATES
+            if is_stuck and not self.was_stuck:
                 w = snap.get("weight") or 0
                 if w > WEIGHT_THRESHOLD:
-                    log_event("hold_weight_present", **snap)  # real cat -> never reset
-                elif self.incident_resets >= RESET_CAP:
-                    if not self.capped:
-                        log_event("reset_cap_reached", resets=self.incident_resets, **snap)
-                        self.capped = True
+                    log_event("hold_weight_present", **snap)  # real cat present -> never reset
                 else:
-                    log_event("reset_press", attempt=self.incident_resets + 1, **snap)
+                    log_event("reset_press", **snap)
                     try:
                         await self.robot.reset()
-                        self.incident_resets += 1
                     except Exception as ex:
                         log_event("reset_error", error=str(ex))
-            elif status in HEALTHY_STATES:
-                if self.incident_resets or self.capped:
-                    log_event("incident_cleared", resets=self.incident_resets, **snap)
-                self.incident_resets = 0
-                self.capped = False
+            elif self.was_stuck and not is_stuck and status in HEALTHY_STATES:
+                log_event("incident_cleared", **snap)
+            self.was_stuck = is_stuck
 
     def on_update(self) -> None:
         # Sync callback from the event system -> schedule async evaluation.
@@ -211,7 +207,7 @@ async def run_once() -> None:
         robot = account.robots[0]
         watcher = Watcher(robot)
         log_event("startup", serial=robot.serial, backstop=BACKSTOP,
-                  weight_threshold=WEIGHT_THRESHOLD, reset_cap=RESET_CAP)
+                  weight_threshold=WEIGHT_THRESHOLD)
         robot.on(EVENT_UPDATE, watcher.on_update)
         await robot.subscribe()
         await watcher.evaluate()  # act on current state immediately

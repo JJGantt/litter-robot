@@ -5,9 +5,8 @@ primary_region = "iad"
 [build]
 
 [env]
-  BACKSTOP_SECONDS = "20"
+  BACKSTOP_SECONDS = "5"
   WEIGHT_THRESHOLD_LB = "3.0"
-  RESET_CAP = "15"
 
 [[vm]]
   size = "shared-cpu-1x"
