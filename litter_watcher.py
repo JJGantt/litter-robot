@@ -61,7 +61,10 @@ HEALTHCHECKS_URL = os.environ.get("HEALTHCHECKS_URL", "")
 GOVEE_API_KEY = os.environ.get("GOVEE_API_KEY", "")
 GOVEE_LIGHT_SKU = os.environ.get("GOVEE_LIGHT_SKU", "")
 GOVEE_LIGHT_DEVICE = os.environ.get("GOVEE_LIGHT_DEVICE", "")
-LIGHT_RGB = {"yellow": (255, 200, 0), "orange": (255, 80, 0)}
+# Status -> override color. Placeholders for now; swap "full"/"offline" for a Govee
+# dynamic-scene trigger later (just change set_closet_light / the override mapping).
+LIGHT_RGB = {"yellow": (255, 200, 0), "orange": (255, 80, 0), "red": (255, 0, 0)}
+DRAWER_FULL_PCT = float(os.environ.get("DRAWER_FULL_PCT", 90))  # drawerPct >= this -> "needs emptying"
 
 # A clean cycle was in progress when it dropped -> worth calling out in the alert.
 MID_CYCLE_STATES = {"CLEAN_CYCLE", "CAT_SENSOR_INTERRUPTED", "PAUSED"}
@@ -125,34 +128,83 @@ async def heartbeat() -> None:
         log_event("heartbeat_error", error=str(ex))
 
 
-async def set_closet_light(desired: str) -> None:
-    """Set the closet status light via Govee cloud. desired: 'off' | 'yellow' | 'orange'. Never raises."""
-    if not (GOVEE_API_KEY and GOVEE_LIGHT_SKU and GOVEE_LIGHT_DEVICE):
-        return
+def _govee_ready() -> bool:
+    return bool(GOVEE_API_KEY and GOVEE_LIGHT_SKU and GOVEE_LIGHT_DEVICE)
 
-    async def _ctrl(cap_type: str, instance: str, value) -> None:
-        payload = {
-            "requestId": str(uuid.uuid4()),
-            "payload": {"sku": GOVEE_LIGHT_SKU, "device": GOVEE_LIGHT_DEVICE,
-                        "capability": {"type": cap_type, "instance": instance, "value": value}},
-        }
+
+async def _govee_ctrl(cap_type: str, instance: str, value) -> None:
+    payload = {
+        "requestId": str(uuid.uuid4()),
+        "payload": {"sku": GOVEE_LIGHT_SKU, "device": GOVEE_LIGHT_DEVICE,
+                    "capability": {"type": cap_type, "instance": instance, "value": value}},
+    }
+    async with httpx.AsyncClient(timeout=10) as client:
+        await client.post(
+            "https://openapi.api.govee.com/router/api/v1/device/control",
+            headers={"Govee-API-Key": GOVEE_API_KEY, "Content-Type": "application/json"},
+            json=payload,
+        )
+
+
+async def set_closet_light(color: str) -> None:
+    """Override the closet light to a named status color (powers on + sets RGB). Never raises."""
+    if not _govee_ready():
+        return
+    try:
+        r, g, b = LIGHT_RGB[color]
+        await _govee_ctrl("devices.capabilities.on_off", "powerSwitch", 1)
+        await _govee_ctrl("devices.capabilities.color_setting", "colorRgb", (r << 16) | (g << 8) | b)
+        log_event("light", state=color)
+    except Exception as ex:
+        log_event("light_error", error=str(ex), color=color)
+
+
+async def get_light_state() -> "dict | None":
+    """Read the closet light's current state so it can be restored later. None on failure.
+
+    Captures power/brightness/color/white. A running dynamic scene restores to a static
+    approximation (whatever color the device reports), not the scene itself.
+    """
+    if not _govee_ready():
+        return None
+    try:
+        payload = {"requestId": str(uuid.uuid4()),
+                   "payload": {"sku": GOVEE_LIGHT_SKU, "device": GOVEE_LIGHT_DEVICE}}
         async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(
-                "https://openapi.api.govee.com/router/api/v1/device/control",
+            resp = await client.post(
+                "https://openapi.api.govee.com/router/api/v1/device/state",
                 headers={"Govee-API-Key": GOVEE_API_KEY, "Content-Type": "application/json"},
                 json=payload,
             )
-
-    try:
-        if desired == "off":
-            await _ctrl("devices.capabilities.on_off", "powerSwitch", 0)
-        else:
-            r, g, b = LIGHT_RGB[desired]
-            await _ctrl("devices.capabilities.on_off", "powerSwitch", 1)
-            await _ctrl("devices.capabilities.color_setting", "colorRgb", (r << 16) | (g << 8) | b)
-        log_event("light", state=desired)
+        caps = {c["instance"]: c.get("state", {}).get("value")
+                for c in resp.json().get("payload", {}).get("capabilities", [])}
+        return {"power": caps.get("powerSwitch"), "brightness": caps.get("brightness"),
+                "colorRgb": caps.get("colorRgb"), "colorTempK": caps.get("colorTemperatureK")}
     except Exception as ex:
-        log_event("light_error", error=str(ex), desired=desired)
+        log_event("light_read_error", error=str(ex))
+        return None
+
+
+async def apply_light_state(state: "dict | None") -> None:
+    """Restore a previously-captured closet light state. Never raises."""
+    if not _govee_ready() or not state:
+        return
+    try:
+        if not state.get("power"):
+            await _govee_ctrl("devices.capabilities.on_off", "powerSwitch", 0)
+            log_event("light_restored", state="off")
+            return
+        await _govee_ctrl("devices.capabilities.on_off", "powerSwitch", 1)
+        if state.get("brightness") is not None:
+            await _govee_ctrl("devices.capabilities.range", "brightness", state["brightness"])
+        if state.get("colorTempK"):       # was in white/temperature mode
+            await _govee_ctrl("devices.capabilities.color_setting", "colorTemperatureK", state["colorTempK"])
+        elif state.get("colorRgb") is not None:
+            await _govee_ctrl("devices.capabilities.color_setting", "colorRgb", state["colorRgb"])
+        log_event("light_restored", brightness=state.get("brightness"),
+                  colorTempK=state.get("colorTempK"), colorRgb=state.get("colorRgb"))
+    except Exception as ex:
+        log_event("light_restore_error", error=str(ex))
 
 
 class Watcher:
@@ -160,8 +212,10 @@ class Watcher:
         self.robot = robot
         self.lock = asyncio.Lock()
         self.last_status = None
-        self.was_stuck = False  # for edge-triggered reset
-        self.last_light = None  # closet status light state
+        self.was_stuck = False        # for edge-triggered reset
+        self.controlling = False      # are we currently overriding the closet light?
+        self.saved_light = None       # user's light state, captured before we took over
+        self.last_override = None     # current override color while controlling
         # offline-failsafe state
         self.offline_since = None
         self.offline_alerted = False
@@ -180,13 +234,19 @@ class Watcher:
                 log_event("status", **snap)
                 self.last_status = status
 
-            # Closet status light: yellow while cycling, orange while stuck, off otherwise.
-            desired_light = ("yellow" if status == "CLEAN_CYCLE"
-                             else "orange" if status in STUCK_STATES
-                             else "off")
-            if desired_light != self.last_light:
-                await set_closet_light(desired_light)
-                self.last_light = desired_light
+            # Closet status light. The watcher only "takes over" when there's something to
+            # show; otherwise it hands the light back to whatever state the user left it in.
+            if not snap["online"]:
+                override = "red"                                   # disconnected (swap for a scene later)
+            elif status == "CLEAN_CYCLE":
+                override = "yellow"
+            elif status in STUCK_STATES:
+                override = "orange"
+            elif (snap.get("drawerPct") or 0) >= DRAWER_FULL_PCT:
+                override = "red"                                   # needs emptying (swap for a scene later)
+            else:
+                override = None                                    # nothing to show -> restore user's light
+            await self.update_light(override)
 
             # --- Offline failsafe (Mode A): alert if the robot is unreachable ---
             now = asyncio.get_event_loop().time()
@@ -227,6 +287,27 @@ class Watcher:
             elif self.was_stuck and not is_stuck and status in HEALTHY_STATES:
                 log_event("incident_cleared", **snap)
             self.was_stuck = is_stuck
+
+    async def update_light(self, override: "str | None") -> None:
+        """Take over the closet light to show `override`, or hand it back to the user.
+
+        On the first override we capture the user's current light state; while overriding
+        we just update the color; when there's nothing to show we restore what we captured.
+        """
+        if override is not None:
+            if not self.controlling:
+                self.saved_light = await get_light_state()  # remember the user's light
+                self.controlling = True
+                self.last_override = None
+                log_event("light_takeover", saved=self.saved_light)
+            if override != self.last_override:
+                await set_closet_light(override)
+                self.last_override = override
+        elif self.controlling:
+            await apply_light_state(self.saved_light)  # hand it back
+            self.controlling = False
+            self.saved_light = None
+            self.last_override = None
 
 
 async def run_once() -> None:
