@@ -65,7 +65,8 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 GOVEE_API_KEY = os.environ.get("GOVEE_API_KEY", "")
 GOVEE_LIGHT_SKU = os.environ.get("GOVEE_LIGHT_SKU", "")
 GOVEE_LIGHT_DEVICE = os.environ.get("GOVEE_LIGHT_DEVICE", "")
-DRAWER_FULL_PCT = float(os.environ.get("DRAWER_FULL_PCT", 90))  # drawerPct >= this -> "needs emptying"
+DRAWER_FULL_PCT = float(os.environ.get("DRAWER_FULL_PCT", 90))  # waste drawer >= this -> "needs emptying"
+LITTER_LOW_PCT = float(os.environ.get("LITTER_LOW_PCT", 75))    # litter level <= this -> "litter low"
 
 # Status -> Govee DIY scene NAME (authored in the Govee app; edit their look there freely).
 # Scene IDs are resolved from these names at startup, so editing a scene's appearance keeps
@@ -73,6 +74,7 @@ DRAWER_FULL_PCT = float(os.environ.get("DRAWER_FULL_PCT", 90))  # drawerPct >= t
 SCENE_CYCLING = "Cycling"
 SCENE_STUCK = "Stuck"
 SCENE_FULL = "Drawer full"
+SCENE_LITTER_LOW = "Litter low"
 SCENE_OFFLINE = "Disconnected"
 _DIY_SCENES: dict = {}  # scene name -> id, populated at startup by load_diy_scenes()
 
@@ -113,6 +115,14 @@ def snapshot(robot) -> dict:
     }
 
 
+def litter_level_pct(snap: dict):
+    """Litter level as a 0-100 percent (the device reports it as a 0-1 fraction)."""
+    v = snap.get("litterPct")
+    if not isinstance(v, (int, float)):
+        return None
+    return round(v * 100, 1) if v <= 1.5 else round(v, 1)
+
+
 async def send_telegram(text: str) -> None:
     """Best-effort Telegram message via the @jaredpi_bot. Never raises."""
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
@@ -142,8 +152,7 @@ async def publish_status(serial: str, snap: dict) -> None:
     """Upsert the robot's current status to Supabase (device_status) for the hub. Never raises."""
     if not (SUPABASE_URL and SUPABASE_KEY):
         return
-    litter = snap.get("litterPct")
-    litter_pct = round(litter * 100, 1) if isinstance(litter, (int, float)) and litter <= 1.5 else litter
+    litter_pct = litter_level_pct(snap)
     row = {
         "device": serial, "name": "Litter-Robot 4", "status": snap.get("status"),
         "litter_level_pct": litter_pct, "waste_drawer_pct": snap.get("drawerPct"),
@@ -304,6 +313,8 @@ class Watcher:
                 override = SCENE_STUCK
             elif (snap.get("drawerPct") or 0) >= DRAWER_FULL_PCT:
                 override = SCENE_FULL
+            elif (litter_level_pct(snap) or 100) <= LITTER_LOW_PCT:
+                override = SCENE_LITTER_LOW
             else:
                 override = None                                    # nothing to show -> restore user's light
             await self.update_light(override)
