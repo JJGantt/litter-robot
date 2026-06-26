@@ -381,20 +381,25 @@ class Watcher:
             self.last_override = None
 
 
+# A connect()/refresh() that hangs beyond this becomes a TimeoutError, which propagates to main()'s reconnect
+# loop — so a stalled Whisker connection self-heals instead of silently freezing the watcher forever (the
+# exact failure we hit: one poll, then a hung refresh with no timeout, no exception, and no reconnect).
+REFRESH_TIMEOUT = 30
+
 async def run_once() -> None:
     account = Account()
-    await account.connect(
+    await asyncio.wait_for(account.connect(
         username=os.environ["LITTER_USER"],
         password=os.environ["LITTER_PASS"],
         load_robots=True,
-    )
+    ), REFRESH_TIMEOUT)
     try:
         robot = account.robots[0]
         watcher = Watcher(robot)
         log_event("startup", serial=robot.serial, slow_poll=SLOW_POLL,
                   fast_poll=FAST_POLL, weight_threshold=WEIGHT_THRESHOLD)
         await load_diy_scenes()   # resolve scene names -> ids before we may trigger one
-        await robot.refresh()
+        await asyncio.wait_for(robot.refresh(), REFRESH_TIMEOUT)
         await watcher.evaluate()  # act on current state immediately
         await heartbeat()         # initial "I'm alive" ping to the dead-man's switch
         last_hb = asyncio.get_event_loop().time()
@@ -430,7 +435,7 @@ async def run_once() -> None:
                 last_hb = now
 
             await asyncio.sleep(interval)
-            await robot.refresh()
+            await asyncio.wait_for(robot.refresh(), REFRESH_TIMEOUT)
             await watcher.evaluate()
     finally:
         try:
