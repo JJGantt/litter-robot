@@ -87,6 +87,19 @@ HEALTHY_STATES = {"CLEAN_CYCLE", "READY", "CLEAN_CYCLE_COMPLETE", "CAT_SENSOR_TI
 ACTIVE_STATES = {"CLEAN_CYCLE", "CAT_SENSOR_INTERRUPTED", "PAUSED"}
 
 
+def latched_cat_detect(status: str, weight: float) -> bool:
+    """CAT_DETECTED while the scale reads empty: the entrance sensor is latched, not occupied.
+    A cat has weight, so zero weight means nothing is in the globe. The firmware refuses to cycle
+    in this state, so it strands indefinitely (observed: 7h33m) — and it is neither a STUCK_STATE
+    nor an ACTIVE_STATE, so nothing else here would ever touch it."""
+    return status == "CAT_DETECTED" and (weight or 0) <= WEIGHT_THRESHOLD
+
+
+def needs_reset(status: str, weight: float) -> bool:
+    """Fault conditions a single reset press clears."""
+    return status in STUCK_STATES or latched_cat_detect(status, weight)
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
@@ -281,6 +294,7 @@ class Watcher:
         self.lock = asyncio.Lock()
         self.last_status = None
         self.was_stuck = False        # for edge-triggered reset
+        self.pending_cycle = False    # latch was cleared; run the cycle it skipped once READY
         self.controlling = False      # are we currently overriding the closet light?
         self.saved_light = None       # user's light state, captured before we took over
         self.last_override = None     # current override color while controlling
@@ -309,7 +323,7 @@ class Watcher:
                 override = SCENE_OFFLINE
             elif status == "CLEAN_CYCLE":
                 override = SCENE_CYCLING
-            elif status in STUCK_STATES:
+            elif needs_reset(status, snap.get("weight")):
                 override = SCENE_STUCK
             elif (snap.get("drawerPct") or 0) >= DRAWER_FULL_PCT:
                 override = SCENE_FULL
@@ -344,13 +358,16 @@ class Watcher:
             # after the robot's ~10-15s response lag; re-pressing during that lag just
             # toggles it back (that was the old oscillation). The next interruption is a
             # fresh rising edge and gets its own single press. No timers, no cooldown.
-            is_stuck = status in STUCK_STATES
+            w = snap.get("weight") or 0
+            is_stuck = needs_reset(status, w)
             if is_stuck and not self.was_stuck:
-                w = snap.get("weight") or 0
                 if w > WEIGHT_THRESHOLD:
                     log_event("hold_weight_present", **snap)  # real cat present -> never reset
                 else:
                     log_event("reset_press", **snap)
+                    # A latch reset lands on READY without cleaning, so the visit that preceded it
+                    # never gets its cycle. Queue one; the block below runs it once READY is observed.
+                    self.pending_cycle = latched_cat_detect(status, w)
                     try:
                         await self.robot.reset()
                     except Exception as ex:
@@ -358,6 +375,21 @@ class Watcher:
             elif self.was_stuck and not is_stuck and status in HEALTHY_STATES:
                 log_event("incident_cleared", **snap)
             self.was_stuck = is_stuck
+
+            # Run the queued cycle only once the press has demonstrably landed (status READY, scale
+            # still empty). Gating on observed state rather than a sleep: the robot takes ~10-15s to
+            # respond, and if weight shows up in the meantime a cat is really in there — stand down.
+            if self.pending_cycle and not is_stuck:
+                if w > WEIGHT_THRESHOLD:
+                    log_event("latch_cycle_cancelled", **snap)
+                    self.pending_cycle = False
+                elif status == "READY":
+                    log_event("latch_cycle_start", **snap)
+                    self.pending_cycle = False
+                    try:
+                        await self.robot.start_cleaning()
+                    except Exception as ex:
+                        log_event("latch_cycle_error", error=str(ex))
 
     async def update_light(self, override: "str | None") -> None:
         """Take over the closet light to show `override`, or hand it back to the user.
