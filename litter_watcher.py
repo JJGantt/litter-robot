@@ -47,6 +47,14 @@ SLOW_POLL = float(os.environ.get("SLOW_POLL_SECONDS", 20))   # idle baseline
 FAST_POLL = float(os.environ.get("FAST_POLL_SECONDS", 1))    # while a cycle is active
 MAX_FAST_SECONDS = float(os.environ.get("MAX_FAST_SECONDS", 600))  # cap on continuous fast-polling
 WEIGHT_THRESHOLD = float(os.environ.get("WEIGHT_THRESHOLD_LB", 3.0))
+
+# Persistent auto-reset cadence: while stuck (no cat on the scale), press reset every RESET_RETRY_SECONDS
+# until it recovers — indefinitely, not a fixed number of tries. The spacing must stay well above the
+# robot's ~10-15s response lag so a press is never re-issued mid-landing (that was the old oscillation).
+# Notifications never stop the retries.
+RESET_RETRY_SECONDS = float(os.environ.get("RESET_RETRY_SECONDS", 45))       # min gap between reset presses
+STUCK_ALERT_SECONDS = float(os.environ.get("STUCK_ALERT_SECONDS", 600))      # first Telegram after stuck this long
+STUCK_REALERT_SECONDS = float(os.environ.get("STUCK_REALERT_SECONDS", 1800)) # remind this often while still stuck
 LOG_DIR = Path(os.environ.get("LOG_DIR", BASE / "logs"))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -293,7 +301,12 @@ class Watcher:
         self.robot = robot
         self.lock = asyncio.Lock()
         self.last_status = None
-        self.was_stuck = False        # for edge-triggered reset
+        # persistent-reset state: retry until it recovers, spaced to avoid the old oscillation
+        self.stuck_since = None       # monotonic time the current stuck episode began
+        self.last_press = None        # monotonic time of our last reset press
+        self.press_count = 0          # reset presses issued this episode (logging)
+        self.last_stuck_alert = None  # monotonic time of the last "still stuck" Telegram
+        self.holding_logged = False   # logged "cat present, holding" once this episode
         self.pending_cycle = False    # latch was cleared; run the cycle it skipped once READY
         self.controlling = False      # are we currently overriding the closet light?
         self.saved_light = None       # user's light state, captured before we took over
@@ -353,28 +366,53 @@ class Watcher:
                 self.offline_alerted = False
                 self.last_online_status = status
 
-            # Edge-triggered reset: press ONCE on the transition INTO a stuck state,
-            # then never again while it stays stuck. A single press resumes the cycle
-            # after the robot's ~10-15s response lag; re-pressing during that lag just
-            # toggles it back (that was the old oscillation). The next interruption is a
-            # fresh rising edge and gets its own single press. No timers, no cooldown.
+            # Persistent auto-reset: while the robot is stuck AND the scale reads empty (no cat), press
+            # reset every RESET_RETRY_SECONDS until it recovers — indefinitely, not just once. A single
+            # press often doesn't land when the fault is physical/borderline (a clump at the pinch points,
+            # a DFI hiccup); spaced retries eventually clear those and cost nothing, since we're already
+            # polling. The spacing is what prevents the old oscillation: it's comfortably longer than the
+            # robot's ~10-15s response lag, so we never re-press mid-landing, and we only ever press on a
+            # poll that STILL sees it stuck. A cat on the scale (weight present) is never touched. We retry
+            # forever, but still ping Telegram (first after STUCK_ALERT_SECONDS, then every
+            # STUCK_REALERT_SECONDS) so a genuinely wedged unit that needs hands-on help isn't missed —
+            # the alert never halts the retries.
             w = snap.get("weight") or 0
             is_stuck = needs_reset(status, w)
-            if is_stuck and not self.was_stuck:
+            if is_stuck:
+                if self.stuck_since is None:
+                    self.stuck_since = now
                 if w > WEIGHT_THRESHOLD:
-                    log_event("hold_weight_present", **snap)  # real cat present -> never reset
-                else:
-                    log_event("reset_press", **snap)
-                    # A latch reset lands on READY without cleaning, so the visit that preceded it
-                    # never gets its cycle. Queue one; the block below runs it once READY is observed.
+                    if not self.holding_logged:
+                        log_event("hold_weight_present", **snap)   # real cat present -> never reset
+                        self.holding_logged = True
+                elif self.last_press is None or (now - self.last_press) >= RESET_RETRY_SECONDS:
+                    self.press_count += 1
+                    log_event("reset_press", attempt=self.press_count,
+                              stuck_for=round(now - self.stuck_since), **snap)
+                    # A latch reset lands on READY without cleaning, so the visit that preceded it never
+                    # gets its cycle. Queue one; the block below runs it once READY is observed.
                     self.pending_cycle = latched_cat_detect(status, w)
                     try:
                         await self.robot.reset()
                     except Exception as ex:
                         log_event("reset_error", error=str(ex))
-            elif self.was_stuck and not is_stuck and status in HEALTHY_STATES:
-                log_event("incident_cleared", **snap)
-            self.was_stuck = is_stuck
+                stuck_for = now - self.stuck_since
+                if stuck_for >= STUCK_ALERT_SECONDS and (self.last_stuck_alert is None
+                        or (now - self.last_stuck_alert) >= STUCK_REALERT_SECONDS):
+                    self.last_stuck_alert = now
+                    mins = int(stuck_for // 60)
+                    log_event("stuck_alert", stuck_minutes=mins, presses=self.press_count, **snap)
+                    await send_telegram(
+                        f"⚠️ Litter-Robot stuck ({status}) for {mins}+ min — auto-reset has tried "
+                        f"{self.press_count}× and is still retrying; may need a hands-on check.")
+            else:
+                if self.stuck_since is not None and status in HEALTHY_STATES:
+                    log_event("incident_cleared", presses=self.press_count, **snap)
+                self.stuck_since = None
+                self.last_press = None
+                self.press_count = 0
+                self.last_stuck_alert = None
+                self.holding_logged = False
 
             # Run the queued cycle only once the press has demonstrably landed (status READY, scale
             # still empty). Gating on observed state rather than a sleep: the robot takes ~10-15s to
@@ -451,8 +489,10 @@ async def run_once() -> None:
                 if not fast_capped and (now - fast_since) >= MAX_FAST_SECONDS:
                     fast_capped = True
                     mins = int(MAX_FAST_SECONDS // 60)
-                    log_event("fast_poll_cap_reached", status=robot.status.name, minutes=mins)
-                    await send_telegram(f"⚠️ Litter-Robot cycle still active after {mins} min — please check it.")
+                    # Just throttle polling back to slow after a long active stretch (an API-load guard).
+                    # This no longer "gives up": reset retries + the stuck alert live in evaluate(), and
+                    # RESET_RETRY_SECONDS > SLOW_POLL so presses keep landing on the slow cadence.
+                    log_event("fast_poll_slowed", status=robot.status.name, minutes=mins)
                 interval = SLOW_POLL if fast_capped else FAST_POLL
             else:
                 if fast_since is not None:
