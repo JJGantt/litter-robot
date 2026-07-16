@@ -52,7 +52,7 @@ WEIGHT_THRESHOLD = float(os.environ.get("WEIGHT_THRESHOLD_LB", 3.0))
 # until it recovers — indefinitely, not a fixed number of tries. The spacing must stay well above the
 # robot's ~10-15s response lag so a press is never re-issued mid-landing (that was the old oscillation).
 # Notifications never stop the retries.
-RESET_RETRY_SECONDS = float(os.environ.get("RESET_RETRY_SECONDS", 45))       # min gap between reset presses
+RESET_RETRY_SECONDS = float(os.environ.get("RESET_RETRY_SECONDS", 30))       # min gap between reset presses
 STUCK_ALERT_SECONDS = float(os.environ.get("STUCK_ALERT_SECONDS", 600))      # first Telegram after stuck this long
 STUCK_REALERT_SECONDS = float(os.environ.get("STUCK_REALERT_SECONDS", 1800)) # remind this often while still stuck
 LOG_DIR = Path(os.environ.get("LOG_DIR", BASE / "logs"))
