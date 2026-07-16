@@ -386,6 +386,7 @@ class Watcher:
                         log_event("hold_weight_present", **snap)   # real cat present -> never reset
                         self.holding_logged = True
                 elif self.last_press is None or (now - self.last_press) >= RESET_RETRY_SECONDS:
+                    self.last_press = now   # record BEFORE the press so the spacing holds even if reset() throws
                     self.press_count += 1
                     log_event("reset_press", attempt=self.press_count,
                               stuck_for=round(now - self.stuck_since), **snap)
