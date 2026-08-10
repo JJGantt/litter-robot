@@ -60,6 +60,17 @@ RESET_RETRY_SECONDS = float(os.environ.get("RESET_RETRY_SECONDS", 30))       # m
 STALL_CONFIRM_SECONDS = float(os.environ.get("STALL_CONFIRM_SECONDS", 30))   # stall must hold an empty scale this long before the FIRST press
 STUCK_ALERT_SECONDS = float(os.environ.get("STUCK_ALERT_SECONDS", 600))      # first Telegram after stuck this long
 STUCK_REALERT_SECONDS = float(os.environ.get("STUCK_REALERT_SECONDS", 1800)) # remind this often while still stuck
+
+# ---- Usage-driven cleaning -----------------------------------------------------------------------
+# The robot is kept in SLEEP mode (set once in the Whisker app) so it never auto-cycles; WE fire the
+# clean. After a cat visit, wait CLEAN_DWELL_S from the LAST visit (a new visit inside the window
+# restarts the clock), then start_cleaning() — but ONLY while online + sleeping + idle, so a lost
+# connection just parks it idle (never a stuck offline cycle). The existing stall watcher still
+# rescues any stall from the cycle we fire. If the robot ever leaves sleep mode we alert (the sleep
+# schedule can't be set back via the API — its write reverts — so it's monitored, not auto-repaired).
+CLEAN_DWELL_S = float(os.environ.get("CLEAN_DWELL_S", 15 * 60))    # min quiet after the last visit
+CLEAN_MIN_GAP_S = float(os.environ.get("CLEAN_MIN_GAP_S", 120))    # never re-fire within this of the last clean
+DRIVE_CLEANING = os.environ.get("DRIVE_CLEANING", "1") not in ("0", "false", "off", "no", "")
 LOG_DIR = Path(os.environ.get("LOG_DIR", BASE / "logs"))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -98,6 +109,8 @@ STUCK_STATES = {"CAT_SENSOR_INTERRUPTED", "PAUSED"}
 HEALTHY_STATES = {"CLEAN_CYCLE", "READY", "CLEAN_CYCLE_COMPLETE", "CAT_SENSOR_TIMING", "OFF"}
 # A cycle is "active" (globe moving or stuck mid-cycle) -> poll fast to stay on top of it.
 ACTIVE_STATES = {"CLEAN_CYCLE", "CAT_SENSOR_INTERRUPTED", "PAUSED"}
+# Also fast-poll while a cat is present, so a visit is never missed (it drives the usage trigger).
+POLL_FAST_STATES = ACTIVE_STATES | {"CAT_DETECTED", "CAT_SENSOR_TIMING"}
 
 
 def needs_reset(status: str) -> bool:
@@ -133,6 +146,8 @@ def snapshot(robot) -> dict:
         "drawerPct": d.get("DFILevelPercent"),
         "litterPct": d.get("litterLevelPercentage"),
         "online": robot.is_online,
+        "is_sleeping": bool(getattr(robot, "is_sleeping", False)),
+        "catWeight": d.get("catWeight"),
     }
 
 
@@ -314,6 +329,12 @@ class Watcher:
         self.offline_since = None
         self.offline_alerted = False
         self.last_online_status = None
+        # usage-driven clean-trigger state
+        self.dirty = False            # a cat has used the box since our last clean
+        self.last_present = None      # monotonic time a cat was last on the scale / a visit was seen
+        self.last_cat_weight = None   # last recorded pet weight (a change = a completed visit)
+        self.last_clean_fired = None  # monotonic time we last issued start_cleaning()
+        self.not_sleeping_alerted = False  # alerted that the robot dropped out of sleep mode
 
     async def evaluate(self) -> None:
         # Single-flight: if an evaluation/reset is already in progress, skip;
@@ -416,6 +437,54 @@ class Watcher:
                 self.last_stuck_alert = None
                 self.holding_logged = False
 
+            # ---- Usage-driven cleaning: we drive the cycle; the robot stays in sleep so it never
+            # auto-cycles. Runs only when online (offline returns above), so a drop just parks it idle. ----
+            if DRIVE_CLEANING:
+                await self.maybe_clean(snap, now)
+
+    async def maybe_clean(self, snap: dict, now: float) -> None:
+        """Fire a clean while the robot is held in sleep mode (no auto-cycle). A cat visit marks the
+        box dirty; once the scale has been empty for CLEAN_DWELL_S since the last visit and we're
+        online + sleeping + idle, WE start the cycle (the stall watcher then rescues any stall)."""
+        if not snap.get("is_sleeping"):
+            # Suppression dropped — the robot will auto-cycle on its own. Alert once (can't set via API).
+            if not self.not_sleeping_alerted:
+                log_event("not_sleeping", **snap)
+                await send_telegram("⚠️ Litter-Robot dropped out of sleep mode — it will auto-cycle on "
+                                    "its own. Re-enable Sleep in the Whisker app to keep it driven.")
+                self.not_sleeping_alerted = True
+            return
+        self.not_sleeping_alerted = False
+
+        w = snap.get("weight") or 0
+        cw = snap.get("catWeight")
+        status = snap["status"]
+        new_weight = (self.last_cat_weight is not None and cw is not None and cw != self.last_cat_weight)
+        if cw is not None:
+            self.last_cat_weight = cw
+
+        # A cat on the scale, a cat-detect status, or a freshly recorded pet weight = the box got used.
+        if (w and w > WEIGHT_THRESHOLD) or status in ("CAT_DETECTED", "CAT_SENSOR_TIMING") or new_weight:
+            self.dirty = True
+            self.last_present = now
+            return  # never cycle while a cat is (or just was) there — the "don't spin on a cat" rule
+
+        if status not in ("READY", "CLEAN_CYCLE_COMPLETE"):   # mid-cycle / stuck is the reset path's job
+            return
+        if not self.dirty or self.last_present is None:
+            return
+        if (now - self.last_present) < CLEAN_DWELL_S:
+            return
+        if self.last_clean_fired is not None and (now - self.last_clean_fired) < CLEAN_MIN_GAP_S:
+            return
+        self.last_clean_fired = now
+        log_event("drive_clean", dwell_min=round((now - self.last_present) / 60), **snap)
+        try:
+            await self.robot.start_cleaning()
+            self.dirty = False
+        except Exception as ex:
+            log_event("drive_clean_error", error=str(ex))
+
     async def update_light(self, override: "str | None") -> None:
         """Take over the closet light to show `override`, or hand it back to the user.
 
@@ -468,7 +537,7 @@ async def run_once() -> None:
         fast_capped = False
         while True:
             now = asyncio.get_event_loop().time()
-            active = robot.status.name in ACTIVE_STATES
+            active = robot.status.name in POLL_FAST_STATES
             if active:
                 if fast_since is None:
                     fast_since = now
