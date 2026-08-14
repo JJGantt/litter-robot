@@ -511,8 +511,13 @@ class Watcher:
 # loop — so a stalled Whisker connection self-heals instead of silently freezing the watcher forever (the
 # exact failure we hit: one poll, then a hung refresh with no timeout, no exception, and no reconnect).
 REFRESH_TIMEOUT = 30
+# Recycle the whole Whisker connection this often. A HALF-OPEN socket makes refresh() return STALE
+# data with no exception and no timeout, so the "hung refresh -> reconnect" guard above never fires and
+# the watcher silently goes blind — it stops seeing visits/cycles while still looking alive (the exact
+# failure on 2026-08-13: no logs, no drive_clean, for a day). A periodic full reconnect bounds that.
+RECONNECT_EVERY_S = float(os.environ.get("RECONNECT_EVERY_S", 600))
 
-async def run_once() -> None:
+async def run_once(watcher: "Watcher") -> None:
     account = Account()
     await asyncio.wait_for(account.connect(
         username=os.environ["LITTER_USER"],
@@ -521,7 +526,7 @@ async def run_once() -> None:
     ), REFRESH_TIMEOUT)
     try:
         robot = account.robots[0]
-        watcher = Watcher(robot)
+        watcher.robot = robot   # re-bind to the fresh robot; the watcher's trigger state persists
         log_event("startup", serial=robot.serial, slow_poll=SLOW_POLL,
                   fast_poll=FAST_POLL, weight_threshold=WEIGHT_THRESHOLD)
         await load_diy_scenes()   # resolve scene names -> ids before we may trigger one
@@ -529,6 +534,7 @@ async def run_once() -> None:
         await watcher.evaluate()  # act on current state immediately
         await heartbeat()         # initial "I'm alive" ping to the dead-man's switch
         last_hb = asyncio.get_event_loop().time()
+        conn_start = last_hb      # when THIS connection opened — recycled every RECONNECT_EVERY_S
 
         # Adaptive polling: slow while idle; ramp to fast the instant a cycle is
         # active (running or stuck) so we never miss a re-interruption; drop back to
@@ -562,6 +568,14 @@ async def run_once() -> None:
                 await publish_status(robot.serial, snapshot(robot))  # keep device_status fresh
                 last_hb = now
 
+            # Recycle the connection on a fixed cadence to defeat a silent half-open socket (a stale
+            # refresh() that returns with no timeout). Only when idle, so an active cycle is never
+            # interrupted; the trigger state lives on the persistent watcher, so a pending clean
+            # survives, and the first evaluate() after reconnecting reconciles a changed catWeight.
+            if not active and (now - conn_start) >= RECONNECT_EVERY_S:
+                log_event("reconnect_cycle", up_min=round((now - conn_start) / 60))
+                return
+
             await asyncio.sleep(interval)
             await asyncio.wait_for(robot.refresh(), REFRESH_TIMEOUT)
             await watcher.evaluate()
@@ -573,9 +587,10 @@ async def run_once() -> None:
 
 
 async def main() -> None:
+    watcher = Watcher(None)   # created once so its trigger state (dirty/last_present/…) survives reconnects
     while True:
         try:
-            await run_once()
+            await run_once(watcher)
         except Exception as ex:
             log_event("connection_error", error=str(ex))
             await asyncio.sleep(10)  # backoff, then reconnect
