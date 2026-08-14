@@ -75,7 +75,12 @@ LOG_DIR = Path(os.environ.get("LOG_DIR", BASE / "logs"))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 # Failsafe / alerting
-OFFLINE_ALERT_SECONDS = float(os.environ.get("OFFLINE_ALERT_SECONDS", 300))   # robot offline this long -> Telegram
+OFFLINE_ALERT_SECONDS = float(os.environ.get("OFFLINE_ALERT_SECONDS", 180))   # robot offline this long -> high-priority alert
+# High-priority phone push via the status-hub app (APNs). Same /api/notify the voice worker uses; the
+# token is the hub's TV_TOKEN. When both are set, offline / sleep-dropped alerts fan out to the app AND
+# Telegram so a dropped connection or a lost sleep-mode can't go unnoticed.
+HUB_NOTIFY_URL = os.environ.get("HUB_NOTIFY_URL", "")
+HUB_NOTIFY_TOKEN = os.environ.get("HUB_NOTIFY_TOKEN", "")
 HEARTBEAT_SECONDS = float(os.environ.get("HEARTBEAT_SECONDS", 1800))          # ping healthchecks this often
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -171,6 +176,25 @@ async def send_telegram(text: str) -> None:
             )
     except Exception as ex:
         log_event("telegram_error", error=str(ex))
+
+
+async def push_app(title: str, body: str, kind: str = "litter") -> None:
+    """Best-effort high-priority phone push through the status-hub app (APNs). Never raises."""
+    if not (HUB_NOTIFY_URL and HUB_NOTIFY_TOKEN):
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(HUB_NOTIFY_URL, params={"token": HUB_NOTIFY_TOKEN},
+                                  json={"kind": kind, "title": title, "body": body})
+            if r.status_code != 200:
+                log_event("app_push_error", status=r.status_code, detail=r.text[:120])
+    except Exception as ex:
+        log_event("app_push_error", error=str(ex))
+
+
+async def notify(title: str, body: str, kind: str = "litter") -> None:
+    """High-priority alert -> BOTH the app (APNs push) and Telegram, so it can't be missed. Never raises."""
+    await asyncio.gather(push_app(title, body, kind), send_telegram(f"{title}\n{body}"))
 
 
 async def heartbeat() -> None:
@@ -375,13 +399,19 @@ class Watcher:
                     mins = int(OFFLINE_ALERT_SECONDS // 60)
                     mid = " It was mid-cycle when it dropped." if self.last_online_status in MID_CYCLE_STATES else ""
                     log_event("offline_alert", last_online_status=self.last_online_status, **snap)
-                    await send_telegram(f"⚠️ Litter-Robot offline for {mins}+ min — can't reach status.{mid}")
+                    await notify("🚨 Litter-Robot offline",
+                                 f"Unreachable for {mins}+ min — it likely dropped WiFi, which can also knock it "
+                                 f"out of sleep mode (it would start auto-cycling on its own).{mid} "
+                                 f"Check the robot / router.",
+                                 "litter_offline")
                     self.offline_alerted = True
                 return
             else:
                 if self.offline_alerted:
                     log_event("recovered_alert", **snap)
-                    await send_telegram("✅ Litter-Robot back online.")
+                    slept = (" Still in sleep mode — good." if snap.get("is_sleeping")
+                             else " ⚠️ It came back NOT in sleep mode — re-enable Sleep in the Whisker app.")
+                    await notify("✅ Litter-Robot back online", f"Reconnected.{slept}", "litter_online")
                 self.offline_since = None
                 self.offline_alerted = False
                 self.last_online_status = status
@@ -450,8 +480,10 @@ class Watcher:
             # Suppression dropped — the robot will auto-cycle on its own. Alert once (can't set via API).
             if not self.not_sleeping_alerted:
                 log_event("not_sleeping", **snap)
-                await send_telegram("⚠️ Litter-Robot dropped out of sleep mode — it will auto-cycle on "
-                                    "its own. Re-enable Sleep in the Whisker app to keep it driven.")
+                await notify("🚨 Litter-Robot left sleep mode",
+                             "It will auto-cycle on its own now (we are no longer driving it). Re-enable "
+                             "Sleep in the Whisker app to hand control back to the watcher.",
+                             "litter_sleep")
                 self.not_sleeping_alerted = True
             return
         self.not_sleeping_alerted = False
