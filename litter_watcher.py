@@ -529,7 +529,10 @@ class Watcher:
         if drawer_full:
             return  # drawer full: a clean is pending (dirty stays set) but we won't fire until it's emptied
 
-        if status not in ("READY", "CLEAN_CYCLE_COMPLETE"):   # mid-cycle / stuck is the reset path's job
+        # DRAWER_FULL is fire-able on purpose: the robot's drawer-full FLAG trips early (seen at 53%
+        # depth) yet the box still cycles fine — the real overpack limit is the depth guard above. Only
+        # mid-cycle / stuck states are excluded (those are the reset path's job).
+        if status not in ("READY", "CLEAN_CYCLE_COMPLETE", "DRAWER_FULL"):
             return
         if not self.dirty or self.last_present is None:
             return
