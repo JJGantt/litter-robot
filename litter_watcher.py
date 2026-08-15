@@ -95,6 +95,7 @@ GOVEE_API_KEY = os.environ.get("GOVEE_API_KEY", "")
 GOVEE_LIGHT_SKU = os.environ.get("GOVEE_LIGHT_SKU", "")
 GOVEE_LIGHT_DEVICE = os.environ.get("GOVEE_LIGHT_DEVICE", "")
 DRAWER_FULL_PCT = float(os.environ.get("DRAWER_FULL_PCT", 90))  # waste drawer >= this -> "needs emptying"
+DRAWER_REALERT_SECONDS = float(os.environ.get("DRAWER_REALERT_SECONDS", 6 * 3600))  # remind this often while full
 LITTER_LOW_PCT = float(os.environ.get("LITTER_LOW_PCT", 75))    # litter level <= this -> "litter low"
 
 # Status -> Govee DIY scene NAME (authored in the Govee app; edit their look there freely).
@@ -359,6 +360,8 @@ class Watcher:
         self.last_cat_weight = None   # last recorded pet weight (a change = a completed visit)
         self.last_clean_fired = None  # monotonic time we last issued start_cleaning()
         self.not_sleeping_alerted = False  # alerted that the robot dropped out of sleep mode
+        self.drawer_full_since = None      # monotonic time the waste drawer first read full
+        self.last_drawer_alert = None      # monotonic time of the last drawer-full alert
 
     async def evaluate(self) -> None:
         # Single-flight: if an evaluation/reset is already in progress, skip;
@@ -488,6 +491,28 @@ class Watcher:
             return
         self.not_sleeping_alerted = False
 
+        # Drawer full: NEVER cycle into it (packs the waste down / risks a jam) and tell Jared to empty it.
+        # Re-remind while it stays full; clear (and resume) once emptied. `dirty` is preserved below, so the
+        # pending clean fires automatically the moment the drawer is emptied.
+        drawer = snap.get("drawerPct") or 0
+        drawer_full = drawer >= DRAWER_FULL_PCT
+        if drawer_full:
+            if self.drawer_full_since is None:
+                self.drawer_full_since = now
+            if self.last_drawer_alert is None or (now - self.last_drawer_alert) >= DRAWER_REALERT_SECONDS:
+                log_event("drawer_full", **snap)
+                await notify("🚨 Litter-Robot drawer full",
+                             f"Waste drawer at {int(drawer)}% — empty it. Cleaning is paused until you do "
+                             f"(cycling now would pack it down / risk a jam).",
+                             "litter_drawer")
+                self.last_drawer_alert = now
+        elif self.drawer_full_since is not None and drawer <= DRAWER_FULL_PCT - 10:
+            log_event("drawer_emptied", **snap)
+            await notify("✅ Litter-Robot drawer emptied",
+                         "Waste drawer cleared — driven cleaning resumed.", "litter_drawer")
+            self.drawer_full_since = None
+            self.last_drawer_alert = None
+
         w = snap.get("weight") or 0
         cw = snap.get("catWeight")
         status = snap["status"]
@@ -500,6 +525,9 @@ class Watcher:
             self.dirty = True
             self.last_present = now
             return  # never cycle while a cat is (or just was) there — the "don't spin on a cat" rule
+
+        if drawer_full:
+            return  # drawer full: a clean is pending (dirty stays set) but we won't fire until it's emptied
 
         if status not in ("READY", "CLEAN_CYCLE_COMPLETE"):   # mid-cycle / stuck is the reset path's job
             return
