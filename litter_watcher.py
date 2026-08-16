@@ -139,6 +139,55 @@ def log_event(event: str, **fields) -> None:
             f.write(json.dumps(rec) + "\n")
     except OSError:
         pass  # ephemeral fs (e.g. no volume mounted) -> stdout still has it
+    _persist_event(rec)  # durable, best-effort mirror to Supabase litter_events
+
+
+# The on-disk log above is wiped on every Fly redeploy, so meaningful events are also mirrored to
+# Supabase (litter_events). These are too noisy / not about the robot to keep: closet-light control and
+# the 10-min reconnect churn (startup / scene reload / reconnect_cycle). Everything else persists.
+SKIP_PERSIST = {"light", "light_takeover", "light_restored", "diy_scenes_loaded",
+                "reconnect_cycle", "startup"}
+_CORE_KEYS = {"ts", "event", "status", "cycleState", "cycleStatus", "weight", "catWeight",
+              "catDetect", "drawerPct", "litterPct", "is_sleeping", "online"}
+_serial = None  # robot serial, set once connected; stamped onto persisted events
+
+
+def _persist_event(rec: dict) -> None:
+    """Fire-and-forget a durable copy of a meaningful event to Supabase litter_events. Never raises.
+    Runs on the main event loop, so it survives run_once() reconnects (only a process exit drops it)."""
+    if not (SUPABASE_URL and SUPABASE_KEY) or rec.get("event") in SKIP_PERSIST:
+        return
+    try:
+        asyncio.get_running_loop().create_task(_persist_event_async(rec))
+    except RuntimeError:
+        pass  # no running loop -> the stdout/file copies still have the event
+
+
+async def _persist_event_async(rec: dict) -> None:
+    lp = rec.get("litterPct")
+    litter_pct = round(lp * 100, 1) if isinstance(lp, (int, float)) and lp <= 1.5 else lp
+    row = {
+        "ts": rec.get("ts"), "device": _serial, "event": rec.get("event"),
+        "status": rec.get("status"), "cycle_state": rec.get("cycleState"),
+        "cycle_status": rec.get("cycleStatus"), "weight": rec.get("weight"),
+        "cat_weight": rec.get("catWeight"), "cat_detect": rec.get("catDetect"),
+        "drawer_pct": rec.get("drawerPct"), "litter_pct": litter_pct,
+        "is_sleeping": rec.get("is_sleeping"), "online": rec.get("online"),
+        "data": {k: v for k, v in rec.items() if k not in _CORE_KEYS} or None,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(
+                f"{SUPABASE_URL}/rest/v1/litter_events",
+                headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                         "Content-Type": "application/json", "Prefer": "return=minimal"},
+                json=row,
+            )
+            if r.status_code >= 300:   # raw print, NOT log_event, so a failure can't recurse
+                print(json.dumps({"ts": now_iso(), "event": "litter_events_error",
+                                  "code": r.status_code, "detail": r.text[:160]}), flush=True)
+    except Exception:
+        pass  # durable log is best-effort; never disrupt the watcher
 
 
 def snapshot(robot) -> dict:
@@ -590,6 +639,8 @@ async def run_once(watcher: "Watcher") -> None:
     try:
         robot = account.robots[0]
         watcher.robot = robot   # re-bind to the fresh robot; the watcher's trigger state persists
+        global _serial
+        _serial = robot.serial  # stamp persisted events with the device serial
         log_event("startup", serial=robot.serial, slow_poll=SLOW_POLL,
                   fast_poll=FAST_POLL, weight_threshold=WEIGHT_THRESHOLD)
         await load_diy_scenes()   # resolve scene names -> ids before we may trigger one
