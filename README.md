@@ -78,7 +78,8 @@ Whisker's [light codes guide](https://www.litter-robot.com/support/article/litte
 
 ## Config
 
-Environment variables (see `.env-litter`, not committed):
+Environment variables (see `.env-litter`, not committed). The safety-critical ones are documented in
+[CLAUDE.md](CLAUDE.md) — do not retune those to make something convenient.
 
 | Var | Default | Meaning |
 |-----|---------|---------|
@@ -94,7 +95,12 @@ Environment variables (see `.env-litter`, not committed):
 | `SCALE_STATIC_TOL` | 0.25 | Max peak-to-peak lb across that window to still call it a drift |
 | `SCALE_RETRY_SECONDS` | 120 | Min gap between tare presses |
 | `SCALE_ALERT_AFTER` | 3 | Failed tare presses before alerting a human |
+| `DRIVE_CLEANING` | 1 | Master switch for firing cleans ourselves; off leaves the box idle |
 | `CLEAN_DWELL_S` | 900 | Quiet time after the last visit before we fire a clean |
+| `CLEAN_MIN_GAP_S` | 120 | Never re-fire a clean within this of the last one |
+| `STUCK_ALERT_SECONDS` / `STUCK_REALERT_SECONDS` | 600 / 1800 | First Telegram on a stall, then how often to remind |
+| `OFFLINE_ALERT_SECONDS` | 180 | Robot unreachable this long → high-priority alert |
+| `DRAWER_FULL_PCT` / `LITTER_LOW_PCT` | 90 / 75 | Thresholds behind the drawer-full and litter-low alerts |
 | `PUBLISH_SECONDS` | 600 | Refresh `device_status` at least this often |
 | `RECONNECT_EVERY_S` | 600 | Recycle the Whisker connection this often |
 | `LOG_DIR` | ./logs | Log directory |
