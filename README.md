@@ -108,11 +108,27 @@ python litter_watcher.py
 
 ## Deploy (Fly.io)
 
-Runs as an always-on worker (no public ports). Credentials live in Fly secrets. There is no CI
-deploy for this repo — it ships from a machine with `flyctl` logged in:
+Runs as an always-on worker (no public ports). Credentials live in Fly secrets.
+
+**Shipping is CI's job.** Pushing a change to `litter_watcher.py`, `requirements.txt`, `Dockerfile`
+or `fly.toml` on `main` runs `.github/workflows/deploy-watcher.yml`, which deploys to Fly and then
+checks the log for a `startup` line — a green deploy only proves Fly accepted the release, not that
+the watcher reconnected to the Whisker API. Trigger it by hand with:
+
+```
+gh workflow run deploy-watcher.yml -R JJGantt/litter-robot
+```
+
+That exists so a fix does not wait on a particular laptop being awake: the Fly deploy token lives in
+the repo's `FLY_API_TOKEN` secret (app-scoped, minted with `fly tokens create deploy`), so any machine
+that can push can ship. Neither the Pi nor the Mac needs `flyctl` for a normal deploy.
+
+Doc-only pushes deliberately do **not** deploy — a restart drops the watcher's in-memory episode
+state (a pending clean, a stall it is part-way through rescuing).
+
+Secrets are still set with flyctl from a logged-in machine:
 
 ```
 fly secrets set LITTER_USER=... LITTER_PASS=...
-fly deploy
 fly logs
 ```
