@@ -1,10 +1,49 @@
+# Deploy the litter watcher to Fly when its code lands on main.
+#
+# This exists so shipping does not depend on which machine happened to write the change. Before it,
+# the only host with flyctl and a Fly token was the Mac, so a fix written on the Pi sat unpushed to
+# production until the laptop was awake — for a watcher whose whole job is to un-stick the box while
+# nobody is looking, that is the wrong dependency. Linux runners bill at 1x, so this is ~free.
 name: Ping
+
 on:
-  workflow_dispatch: {}
+  push:
+    branches: [main]
+    # Only when something that actually ships changed — a README edit should not restart the watcher
+    # and lose the in-memory episode state (a pending clean, a stall it is mid-way through rescuing).
+    paths:
+      - 'litter_watcher.py'
+      - 'requirements.txt'
+      - 'Dockerfile'
+      - 'fly.toml'
+      - '.github/workflows/deploy-watcher.yml'
+  workflow_dispatch: {}      # and by hand, for a redeploy with no code change
+
+concurrency:
+  group: ping-test
+  cancel-in-progress: false
+
 jobs:
-  ping:
+  deploy:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: superfly/flyctl-actions/setup-flyctl@master
-      - run: flyctl version
+      - run: flyctl deploy --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      - name: Verify it reconnected to the robot
+        # A green deploy only means Fly accepted the release. The watcher has no port to poll, so ask
+        # its log instead: it prints a `startup` line the moment it is talking to the Whisker API again.
+        # No startup line = it booted and failed to connect, which looks identical to "deployed fine".
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          for i in $(seq 1 10); do
+            sleep 6
+            if flyctl logs -a litter-robot-watcher --no-tail 2>/dev/null | tail -40 | grep -q '"event": "startup"'; then
+              echo "watcher reconnected"; exit 0
+            fi
+            echo "attempt $i: no startup line yet"
+          done
+          echo "watcher did not log a startup line after deploy"; exit 1
