@@ -17,6 +17,10 @@ a confirm dwell before the first press, so a normal (transient) cat visit is nev
 only a genuine stall persists that long. Then retry on a spaced cadence (past the robot's
 ~10-15s response lag, so we never re-press mid-landing) until it clears.
 
+Phantom weight: the opposite failure. The scale drifts off zero on an IDLE box, the robot decides a
+cat is standing in it, and after 30 minutes it locks out with a blue bar + partial yellow flashing and
+stops cycling. We tare it with the same reset press, gated on the reading being static (a cat's is not).
+
 Failsafe: Telegram alert if the robot is unreachable; a healthchecks.io heartbeat
 so an external monitor catches a dead watcher. Reconnects on any failure.
 
@@ -28,6 +32,7 @@ Config (env, with defaults):
   FAST_POLL_SECONDS          - poll interval while a cycle is active (default 1)
   MAX_FAST_SECONDS           - safety cap: stop fast-polling after this long (default 600)
   WEIGHT_THRESHOLD_LB        - max weight treated as "no cat" (default 3.0)
+  SCALE_STUCK_SECONDS        - non-zero scale on an idle box this long -> auto-tare (default 1800)
   LOG_DIR                    - log directory (default ./logs)
 """
 
@@ -61,6 +66,26 @@ STALL_CONFIRM_SECONDS = float(os.environ.get("STALL_CONFIRM_SECONDS", 30))   # s
 STUCK_ALERT_SECONDS = float(os.environ.get("STUCK_ALERT_SECONDS", 600))      # first Telegram after stuck this long
 STUCK_REALERT_SECONDS = float(os.environ.get("STUCK_REALERT_SECONDS", 1800)) # remind this often while still stuck
 
+# ---- Phantom weight (a scale that never returns to zero) -------------------------------------------
+# A second, opposite failure to the stall above. The LR4's scale drifts off zero — a nudge, litter
+# added, the drawer emptied, a foot caught on the mat — and the robot then believes a cat is standing
+# in it forever. Its firmware gives up after 30 minutes and shows a BLUE light bar with PARTIAL YELLOW
+# FLASHING, and while that is showing THE BOX WILL NOT CYCLE. Whisker's own fix is a short reset press,
+# which re-zeroes the scale — exactly the button we can already press.
+# The stall watcher above can never catch this: it fires on a mid-cycle stall with an EMPTY scale, and
+# this is an idle box with a NON-empty one, so it was a blind spot by construction.
+# Gates before we press, so a real cat is never spun:
+#   * the box must be idle (no cycle running, not stuck — those are the reset path's job);
+#   * the scale must read non-zero continuously for SCALE_STUCK_SECONDS. The default is the robot's own
+#     30 minutes, so we are never more aggressive than the manufacturer's "this cannot be a cat";
+#   * the reading must be essentially STATIC across that window. A live animal's weight wanders as it
+#     shifts; a drifted zero is dead flat. If it wanders we do not press — we alert instead.
+SCALE_ZERO_TOL = float(os.environ.get("SCALE_ZERO_TOL", 0.2))            # |lb| below this = a zeroed scale
+SCALE_STUCK_SECONDS = float(os.environ.get("SCALE_STUCK_SECONDS", 1800)) # non-zero this long on an idle box = phantom
+SCALE_STATIC_TOL = float(os.environ.get("SCALE_STATIC_TOL", 0.25))       # max peak-to-peak lb across that window
+SCALE_RETRY_SECONDS = float(os.environ.get("SCALE_RETRY_SECONDS", 120))  # min gap between tare presses
+SCALE_ALERT_AFTER = int(os.environ.get("SCALE_ALERT_AFTER", 3))          # presses that fail to clear it -> call a human
+
 # ---- Usage-driven cleaning -----------------------------------------------------------------------
 # The robot is kept in SLEEP mode (set once in the Whisker app) so it never auto-cycles; WE fire the
 # clean. After a cat visit, wait CLEAN_DWELL_S from the LAST visit (a new visit inside the window
@@ -81,7 +106,10 @@ OFFLINE_ALERT_SECONDS = float(os.environ.get("OFFLINE_ALERT_SECONDS", 180))   # 
 # Telegram so a dropped connection or a lost sleep-mode can't go unnoticed.
 HUB_NOTIFY_URL = os.environ.get("HUB_NOTIFY_URL", "")
 HUB_NOTIFY_TOKEN = os.environ.get("HUB_NOTIFY_TOKEN", "")
-HEARTBEAT_SECONDS = float(os.environ.get("HEARTBEAT_SECONDS", 1800))          # ping healthchecks this often
+# The dead-man ping is fed once per connection cycle (see RECONNECT_EVERY_S), so it needs no interval
+# of its own. device_status does: the hub's litter card is only as fresh as our last write, and writing
+# it solely on a status change left the card reading hours stale whenever the robot sat idle.
+PUBLISH_SECONDS = float(os.environ.get("PUBLISH_SECONDS", 600))               # refresh device_status at least this often
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 HEALTHCHECKS_URL = os.environ.get("HEALTHCHECKS_URL", "")
@@ -112,6 +140,8 @@ _DIY_SCENES: dict = {}  # scene name -> id, populated at startup by load_diy_sce
 MID_CYCLE_STATES = {"CLEAN_CYCLE", "CAT_SENSOR_INTERRUPTED", "PAUSED"}
 
 STUCK_STATES = {"CAT_SENSOR_INTERRUPTED", "PAUSED"}
+# Idle: the globe is parked and the scale SHOULD read zero, so anything on it is a cat or a drift.
+SCALE_IDLE_STATES = {"READY", "CLEAN_CYCLE_COMPLETE", "DRAWER_FULL"}
 HEALTHY_STATES = {"CLEAN_CYCLE", "READY", "CLEAN_CYCLE_COMPLETE", "CAT_SENSOR_TIMING", "OFF"}
 # A cycle is "active" (globe moving or stuck mid-cycle) -> poll fast to stay on top of it.
 ACTIVE_STATES = {"CLEAN_CYCLE", "CAT_SENSOR_INTERRUPTED", "PAUSED"}
@@ -203,6 +233,10 @@ def snapshot(robot) -> dict:
         "online": robot.is_online,
         "is_sleeping": bool(getattr(robot, "is_sleeping", False)),
         "catWeight": d.get("catWeight"),
+        # The raw firmware display code — what the light bar is actually showing. pylitterbot only
+        # maps one value of it into .status, so anything else (the phantom-weight trip included) is
+        # invisible in `status` alone. Carried so the LED state lands in the durable log.
+        "displayCode": d.get("displayCode"),
     }
 
 
@@ -411,6 +445,16 @@ class Watcher:
         self.not_sleeping_alerted = False  # alerted that the robot dropped out of sleep mode
         self.drawer_full_since = None      # monotonic time the waste drawer first read full
         self.last_drawer_alert = None      # monotonic time of the last drawer-full alert
+        # phantom-weight state: a scale that never came back to zero on an idle box
+        self.scale_since = None            # monotonic time the scale first read non-zero this episode
+        self.scale_min = None              # min/max seen since -> how much the reading wanders
+        self.scale_max = None
+        self.scale_presses = 0             # tare presses issued this episode
+        self.last_scale_press = None       # monotonic time of the last tare press
+        self.scale_alerted = False         # already asked for a human this episode
+        self.scale_flagged = False         # confirmed phantom right now (drives the closet light)
+        self.last_display_code = None      # last firmware display code seen (logged on change)
+        self.last_publish = None           # monotonic time device_status was last written
 
     async def evaluate(self) -> None:
         # Single-flight: if an evaluation/reset is already in progress, skip;
@@ -421,10 +465,24 @@ class Watcher:
             snap = snapshot(self.robot)
             status = snap["status"]
 
+            now = asyncio.get_event_loop().time()
+
             if status != self.last_status:
                 log_event("status", **snap)
                 self.last_status = status
                 await publish_status(self.robot.serial, snap)
+                self.last_publish = now
+            elif self.last_publish is None or (now - self.last_publish) >= PUBLISH_SECONDS:
+                # Keep the hub's card honest even through a long idle stretch — otherwise its
+                # "last updated" is the last time the robot happened to change state.
+                await publish_status(self.robot.serial, snap)
+                self.last_publish = now
+
+            # The display code is the light bar. Log every change: it is the only record of what the
+            # robot was showing, and most of its values never reach `status` at all.
+            if snap.get("displayCode") != self.last_display_code:
+                log_event("display_code", **snap)
+                self.last_display_code = snap.get("displayCode")
 
             # Closet status light. The watcher only "takes over" when there's something to
             # show; otherwise it hands the light back to whatever state the user left it in.
@@ -432,7 +490,7 @@ class Watcher:
                 override = SCENE_OFFLINE
             elif status == "CLEAN_CYCLE":
                 override = SCENE_CYCLING
-            elif needs_reset(status):
+            elif needs_reset(status) or self.scale_flagged:
                 override = SCENE_STUCK
             elif (snap.get("drawerPct") or 0) >= DRAWER_FULL_PCT:
                 override = SCENE_FULL
@@ -443,8 +501,8 @@ class Watcher:
             await self.update_light(override)
 
             # --- Offline failsafe (Mode A): alert if the robot is unreachable ---
-            now = asyncio.get_event_loop().time()
             if not snap["online"]:
+                self._end_scale_episode()   # a stale reading proves nothing; start over when it returns
                 if self.offline_since is None:
                     self.offline_since = now
                 elif not self.offline_alerted and (now - self.offline_since) >= OFFLINE_ALERT_SECONDS:
@@ -519,10 +577,91 @@ class Watcher:
                 self.last_stuck_alert = None
                 self.holding_logged = False
 
+            # ---- Phantom weight: an idle box whose scale never came back to zero. Left alone it
+            # trips the robot's own 30-minute lockout (blue bar, partial yellow flashing) and the box
+            # stops cycling entirely until someone presses reset. ----
+            await self.check_scale(snap, now)
+
             # ---- Usage-driven cleaning: we drive the cycle; the robot stays in sleep so it never
             # auto-cycles. Runs only when online (offline returns above), so a drop just parks it idle. ----
             if DRIVE_CLEANING:
                 await self.maybe_clean(snap, now)
+
+    def _end_scale_episode(self) -> None:
+        self.scale_since = None
+        self.scale_min = self.scale_max = None
+        self.scale_presses = 0
+        self.last_scale_press = None
+        self.scale_alerted = False
+        self.scale_flagged = False
+
+    async def check_scale(self, snap: dict, now: float) -> None:
+        """Tare a scale that has drifted off zero, before (or after) the robot locks itself out.
+
+        Only ever runs on an IDLE box: a cycle in flight, a stall, a cat-detect status and an offline
+        robot all belong to other paths, and a moving globe makes the reading meaningless anyway.
+        Presses only once the reading has been non-zero AND essentially static for SCALE_STUCK_SECONDS
+        — a cat shifts its weight, a drifted zero does not — so a real animal is never spun.
+        """
+        status = snap["status"]
+        w = snap.get("weight")
+        if status not in SCALE_IDLE_STATES or not isinstance(w, (int, float)):
+            self._end_scale_episode()
+            return
+
+        if abs(w) <= SCALE_ZERO_TOL:
+            if self.scale_since is not None:
+                log_event("scale_cleared", held_min=round((now - self.scale_since) / 60),
+                          presses=self.scale_presses, **snap)
+            self._end_scale_episode()
+            return
+
+        if self.scale_since is None:
+            self.scale_since = now
+            self.scale_min = self.scale_max = w
+            log_event("scale_nonzero", **snap)
+        self.scale_min = min(self.scale_min, w)
+        self.scale_max = max(self.scale_max, w)
+        held = now - self.scale_since
+        if held < SCALE_STUCK_SECONDS:
+            return
+
+        spread = round(self.scale_max - self.scale_min, 2)
+        self.scale_flagged = True
+        if spread > SCALE_STATIC_TOL:
+            # It wanders -> something really is in there (a cat that has settled in for the afternoon,
+            # or litter sliding around). Never press; just say so once, because the robot has locked
+            # itself out by now and will not cycle until it clears.
+            if not self.scale_alerted:
+                self.scale_alerted = True
+                log_event("scale_occupied", held_min=round(held / 60), spread=spread, **snap)
+                await notify("⚠️ Litter-Robot scale still loaded",
+                             f"{round(w, 1)} lb on the scale for {int(held // 60)}+ min and still moving, "
+                             f"so it is not being auto-tared. The robot will not cycle until it clears.",
+                             "litter_scale")
+            return
+
+        if self.last_scale_press is not None and (now - self.last_scale_press) < SCALE_RETRY_SECONDS:
+            return
+        self.last_scale_press = now
+        self.scale_presses += 1
+        log_event("scale_tare", attempt=self.scale_presses, held_min=round(held / 60),
+                  spread=spread, **snap)
+        try:
+            await self.robot.reset()   # short reset press = zero the weight scale
+        except Exception as ex:
+            log_event("scale_tare_error", error=str(ex))
+
+        if self.scale_presses >= SCALE_ALERT_AFTER and not self.scale_alerted:
+            # Reset is the manufacturer's own fix; if it will not take, the base is the suspect
+            # (Whisker replaces it under WhiskerCare for exactly this symptom).
+            self.scale_alerted = True
+            await notify("🚨 Litter-Robot scale stuck",
+                         f"The scale has read {round(w, 1)} lb on an empty, idle box for "
+                         f"{int(held // 60)}+ min and {self.scale_presses} reset presses have not zeroed "
+                         f"it. Check the feet/mat and the litter level; if it keeps happening the base "
+                         f"scale is failing.",
+                         "litter_scale")
 
     async def maybe_clean(self, snap: dict, now: float) -> None:
         """Fire a clean while the robot is held in sleep mode (no auto-cycle). A cat visit marks the
@@ -646,9 +785,12 @@ async def run_once(watcher: "Watcher") -> None:
         await load_diy_scenes()   # resolve scene names -> ids before we may trigger one
         await asyncio.wait_for(robot.refresh(), REFRESH_TIMEOUT)
         await watcher.evaluate()  # act on current state immediately
-        await heartbeat()         # initial "I'm alive" ping to the dead-man's switch
-        last_hb = asyncio.get_event_loop().time()
-        conn_start = last_hb      # when THIS connection opened — recycled every RECONNECT_EVERY_S
+        # Feed the dead-man's switch once per connection. That is the whole cadence: this function
+        # returns and is re-entered every RECONNECT_EVERY_S, so the ping lands on that interval. A
+        # separate interval here was the bug — its clock was a local, reset on every reconnect, so it
+        # never matured and the device_status refresh that hung off it never ran at all.
+        await heartbeat()
+        conn_start = asyncio.get_event_loop().time()   # when THIS connection opened
 
         # Adaptive polling: slow while idle; ramp to fast the instant a cycle is
         # active (running or stuck) so we never miss a re-interruption; drop back to
@@ -676,11 +818,6 @@ async def run_once(watcher: "Watcher") -> None:
                 fast_since = None
                 fast_capped = False
                 interval = SLOW_POLL
-
-            if now - last_hb >= HEARTBEAT_SECONDS:
-                await heartbeat()
-                await publish_status(robot.serial, snapshot(robot))  # keep device_status fresh
-                last_hb = now
 
             # Recycle the connection on a fixed cadence to defeat a silent half-open socket (a stale
             # refresh() that returns with no timeout). Only when idle, so an active cycle is never
