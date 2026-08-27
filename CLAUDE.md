@@ -17,6 +17,18 @@ that whole window (`SCALE_STATIC_TOL`). Each gate is load-bearing:
 A cat spun in the globe is the one outcome this repo exists to prevent. Do not shorten the window,
 widen the tolerance, or skip a gate to make a test easier.
 
+`check_lockout` presses on a second, narrower case — the robot's own `DC_CAT_DETECT_30M` lockout,
+still showing over a scale that reads zero — and it reaches that by *adding* gates, never by dropping
+one of the above. The firmware has already served the 30 minutes; a zero reading means there is
+nothing on the scale to spin; a non-zero reading is handed back to the auto-tare, which is the path
+that alerts rather than presses when the weight wanders. The suffix is the whole safety margin:
+`DC_CAT_DETECT` without it is a live cat standing on the scale.
+
+`test_lockout.py` writes each of those gates down as a case and the deploy workflow runs it, so a
+gate removed in `check_lockout` fails the build rather than the animal. Run it directly —
+`python3 test_lockout.py` — it stubs its imports and needs nothing installed. Add a case there when
+you add a gate.
+
 ## The robot is held in Sleep Mode on purpose
 
 Solid purple is the normal resting colour here, not a fault. Sleep Mode is what stops the robot

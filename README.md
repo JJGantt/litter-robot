@@ -3,14 +3,14 @@
 Auto-resume watcher for the Litter-Robot 4 (Whisker), built on the unofficial
 [`pylitterbot`](https://github.com/natekspencer/pylitterbot) API. It runs as an always-on
 Fly worker and drives the box: it keeps the robot in Sleep Mode so the robot never cycles on
-its own, fires the clean cycle itself after a visit, rescues the two ways the box gets stuck,
+its own, fires the clean cycle itself after a visit, rescues the three ways the box gets stuck,
 mirrors status to Supabase for the status hub, and colours a Govee closet light with what it
 is doing.
 
-## The two failures it fixes
+## The three failures it fixes
 
-Both come from the same flaky part — the LR4's weight scale — and they are exact opposites,
-which is why each needs its own detector.
+All three come from the same flaky part — the LR4's weight scale, and they fail in opposite
+directions, which is why each needs its own detector and why none of them can cover another.
 
 **1. A stall mid-cycle (empty scale).** The robot throws a false `CAT_SENSOR_INTERRUPTED`
 partway through a clean cycle: the scale reads ~0 (no cat), but the globe halts, open.
@@ -39,6 +39,26 @@ a cat that has genuinely settled in for the afternoon is safe.
 If several tare presses fail to zero it, that is the symptom Whisker replaces the base unit
 for under WhiskerCare, and the alert says so.
 
+**3. A lockout still showing after the scale has come back to zero.** The same 30-minute
+lockout as failure 2, outliving the weight that caused it. Detector 2 cannot end this one: it
+starts its dwell on a *non-zero* reading, and the scale now reads 0.0, so it sees a clean idle
+box and never begins. Detector 1 wants a stalled mid-cycle status, and this one is `READY`. The
+box sits dead with nothing looking at it — 80 minutes of it on 2026-08-27, and it would have
+stayed that way until a human noticed the light bar.
+
+The watcher presses Reset once `DC_CAT_DETECT_30M` has held for `LOCKOUT_CONFIRM_SECONDS`
+(default 120) on an idle box whose scale reads zero. The suffix carries the whole meaning:
+`DC_CAT_DETECT_30M` is the lockout, while plain `DC_CAT_DETECT` is an ordinary cat standing on
+the scale and is never acted on.
+
+This is a **narrower** case than detector 2, not a looser one. The robot's own firmware has
+already spent its 30 minutes deciding this cannot be an animal, and a scale reading zero means
+there is nothing on it to spin; the globe is parked, so the press is a tare and not a cycle. A
+non-zero reading is handed straight back to detector 2 — the path that alerts instead of
+pressing when the weight wanders, which is what keeps a cat that has settled in for the
+afternoon safe. `test_lockout.py` states each of those gates as a case, and the deploy workflow
+runs it before it ships.
+
 ## Litter-Robot 4 light codes worth knowing
 
 The panel is the only place some of these states are ever reported. The full list is in
@@ -47,7 +67,7 @@ Whisker's [light codes guide](https://www.litter-robot.com/support/article/litte
 | Light bar | Means | Notes |
 |---|---|---|
 | **Solid purple** | Sleep Mode active | This is the normal resting colour here — the watcher deliberately keeps the robot asleep and fires cleans itself |
-| **Blue, partial yellow flashing** | Scale triggered 30+ min | Failure 2 above. The box will not cycle. Reset zeroes the scale |
+| **Blue, partial yellow flashing** | Scale triggered 30+ min (`DC_CAT_DETECT_30M`) | Failures 2 and 3 above. The box will not cycle. Reset zeroes the scale |
 | **Blue flashing** | Waste drawer full | Empty it, press Reset |
 | **Blue with one yellow blink by the Connect button** | Wi-Fi lost / onboarding | Not a reset fix — re-run Update Network in the Whisker app |
 | **Solid yellow** | Paused | |

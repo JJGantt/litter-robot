@@ -21,6 +21,11 @@ Phantom weight: the opposite failure. The scale drifts off zero on an IDLE box, 
 cat is standing in it, and after 30 minutes it locks out with a blue bar + partial yellow flashing and
 stops cycling. We tare it with the same reset press, gated on the reading being static (a cat's is not).
 
+Lockout: that same 30-minute cat-detect, still showing after the weight behind it has fallen back to
+zero. The tare never begins (it waits on a non-zero reading) and the stall watcher wants a mid-cycle
+status, so the box sits dead with nothing looking at it. We press reset once the robot's own verdict
+has held over an empty scale.
+
 Failsafe: Telegram alert if the robot is unreachable; a healthchecks.io heartbeat
 so an external monitor catches a dead watcher. Reconnects on any failure.
 
@@ -33,6 +38,7 @@ Config (env, with defaults):
   MAX_FAST_SECONDS           - safety cap: stop fast-polling after this long (default 600)
   WEIGHT_THRESHOLD_LB        - max weight treated as "no cat" (default 3.0)
   SCALE_STUCK_SECONDS        - non-zero scale on an idle box this long -> auto-tare (default 1800)
+  LOCKOUT_CONFIRM_SECONDS    - 30-min cat-detect held over an empty scale this long -> reset (default 120)
   LOG_DIR                    - log directory (default ./logs)
 """
 
@@ -85,6 +91,19 @@ SCALE_STUCK_SECONDS = float(os.environ.get("SCALE_STUCK_SECONDS", 1800)) # non-z
 SCALE_STATIC_TOL = float(os.environ.get("SCALE_STATIC_TOL", 0.25))       # max peak-to-peak lb across that window
 SCALE_RETRY_SECONDS = float(os.environ.get("SCALE_RETRY_SECONDS", 120))  # min gap between tare presses
 SCALE_ALERT_AFTER = int(os.environ.get("SCALE_ALERT_AFTER", 3))          # presses that fail to clear it -> call a human
+
+# ---- Firmware lockout latched over a scale that reads zero -----------------------------------------
+# The third failure, and the one nothing else can reach. The robot trips its own 30-minute cat-detect
+# lockout and stops cycling — but the weight it latched on then falls back to zero. check_scale starts
+# its dwell on a NON-ZERO reading, so it sees a clean, idle box and never begins; the stall watcher
+# needs a mid-cycle status and this one is READY. The box is simply dead until a human presses reset.
+# Observed 2026-08-27: 80 minutes locked out with weight 0.0, no detector even looking at it.
+# DC_CAT_DETECT_30M is the lockout specifically. DC_CAT_DETECT (no suffix) is an ordinary cat on the
+# scale and must never be acted on — that is a live animal, and the two differ only by that suffix.
+LOCKOUT_DISPLAY_CODES = {"DC_CAT_DETECT_30M"}
+LOCKOUT_CONFIRM_SECONDS = float(os.environ.get("LOCKOUT_CONFIRM_SECONDS", 120))  # hold across polls before the first press
+LOCKOUT_RETRY_SECONDS = float(os.environ.get("LOCKOUT_RETRY_SECONDS", 300))      # min gap between presses
+LOCKOUT_ALERT_AFTER = int(os.environ.get("LOCKOUT_ALERT_AFTER", 3))              # presses that fail to clear it -> call a human
 
 # ---- Usage-driven cleaning -----------------------------------------------------------------------
 # The robot is kept in SLEEP mode (set once in the Whisker app) so it never auto-cycles; WE fire the
@@ -454,6 +473,12 @@ class Watcher:
         self.scale_alerted = False         # already asked for a human this episode
         self.scale_flagged = False         # confirmed phantom right now (drives the closet light)
         self.last_display_code = None      # last firmware display code seen (logged on change)
+        # lockout state: the robot's own 30-minute cat-detect, latched over a scale that reads zero
+        self.lockout_since = None          # monotonic time the lockout was first seen this episode
+        self.lockout_presses = 0           # reset presses issued this episode
+        self.last_lockout_press = None     # monotonic time of the last press
+        self.lockout_alerted = False       # already asked for a human this episode
+        self.lockout_flagged = False       # locked out right now (drives the closet light)
         self.last_publish = None           # monotonic time device_status was last written
 
     async def evaluate(self) -> None:
@@ -490,7 +515,7 @@ class Watcher:
                 override = SCENE_OFFLINE
             elif status == "CLEAN_CYCLE":
                 override = SCENE_CYCLING
-            elif needs_reset(status) or self.scale_flagged:
+            elif needs_reset(status) or self.scale_flagged or self.lockout_flagged:
                 override = SCENE_STUCK
             elif (snap.get("drawerPct") or 0) >= DRAWER_FULL_PCT:
                 override = SCENE_FULL
@@ -582,6 +607,11 @@ class Watcher:
             # stops cycling entirely until someone presses reset. ----
             await self.check_scale(snap, now)
 
+            # ---- Lockout: the robot latched its own 30-minute cat-detect and the weight that caused
+            # it has since fallen back to zero, so check_scale above never starts a dwell and the box
+            # stays dead. Runs after it, and declines any episode that one owns. ----
+            await self.check_lockout(snap, now)
+
             # ---- Usage-driven cleaning: we drive the cycle; the robot stays in sleep so it never
             # auto-cycles. Runs only when online (offline returns above), so a drop just parks it idle. ----
             if DRIVE_CLEANING:
@@ -662,6 +692,67 @@ class Watcher:
                          f"it. Check the feet/mat and the litter level; if it keeps happening the base "
                          f"scale is failing.",
                          "litter_scale")
+
+    def _end_lockout_episode(self) -> None:
+        self.lockout_since = None
+        self.lockout_presses = 0
+        self.last_lockout_press = None
+        self.lockout_alerted = False
+        self.lockout_flagged = False
+
+    async def check_lockout(self, snap: dict, now: float) -> None:
+        """Clear a 30-minute cat-detect lockout that is latched over an EMPTY scale.
+
+        While it shows, the box will not cycle at all, and no other path here can end it: check_scale
+        begins its dwell on a non-zero reading and this reading has already fallen back to zero, and the
+        stall watcher wants a mid-cycle status where this one is READY. So the box stays dead until a
+        human presses the button — 80 minutes of it on 2026-08-27, with every detector looking elsewhere.
+
+        This does not weaken the auto-tare's gates; it presses on a strictly narrower case. Required:
+        an idle box (a parked globe — the same state check_scale tares in, where a reset zeroes the
+        scale rather than moving anything), the robot's OWN verdict that 30 minutes of continuous
+        detection cannot be an animal, and a scale reading zero, so there is nothing on it to spin. A
+        non-zero reading is check_scale's episode and this one declines it — which is what keeps a
+        settled cat, whose weight wanders, on the path that alerts instead of pressing.
+        """
+        w = snap.get("weight")
+        locked = (snap.get("displayCode") in LOCKOUT_DISPLAY_CODES
+                  and snap["status"] in SCALE_IDLE_STATES
+                  and isinstance(w, (int, float)) and abs(w) <= SCALE_ZERO_TOL)
+        if not locked:
+            if self.lockout_since is not None:
+                log_event("lockout_cleared", held_min=round((now - self.lockout_since) / 60),
+                          presses=self.lockout_presses, **snap)
+            self._end_lockout_episode()
+            return
+
+        if self.lockout_since is None:
+            self.lockout_since = now
+            log_event("lockout_seen", **snap)
+        held = now - self.lockout_since
+        # Hold it across several polls first. The Whisker API serves stale snapshots without error, and
+        # a code the robot is already leaving is not worth a press.
+        if held < LOCKOUT_CONFIRM_SECONDS:
+            return
+        self.lockout_flagged = True        # confirmed dead until this clears -> closet light says stuck
+
+        if self.last_lockout_press is not None and (now - self.last_lockout_press) < LOCKOUT_RETRY_SECONDS:
+            return
+        self.last_lockout_press = now
+        self.lockout_presses += 1
+        log_event("lockout_reset", attempt=self.lockout_presses, held_min=round(held / 60), **snap)
+        try:
+            await self.robot.reset()   # short reset press = clear the latch and re-zero the scale
+        except Exception as ex:
+            log_event("lockout_reset_error", error=str(ex))
+
+        if self.lockout_presses >= LOCKOUT_ALERT_AFTER and not self.lockout_alerted:
+            self.lockout_alerted = True
+            await notify("🚨 Litter-Robot stuck in lockout",
+                         f"The box has shown its 30-minute cat-detect lockout for {int(held // 60)}+ min "
+                         f"over an empty scale, and {self.lockout_presses} reset presses have not cleared "
+                         f"it. It is not cycling until someone touches it.",
+                         "litter_lockout")
 
     async def maybe_clean(self, snap: dict, now: float) -> None:
         """Fire a clean while the robot is held in sleep mode (no auto-cycle). A cat visit marks the

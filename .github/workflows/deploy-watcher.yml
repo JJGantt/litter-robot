@@ -28,6 +28,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Gate checks
+        # This watcher presses a physical button on a machine with a cat in it. The gates that decide
+        # when it may are stated as cases in test_lockout.py; run them before shipping, so one removed
+        # fails here rather than in the globe. It stubs its imports, so there is nothing to install.
+        run: python3 test_lockout.py
       - uses: superfly/flyctl-actions/setup-flyctl@master
       - run: flyctl deploy --remote-only
         env:
