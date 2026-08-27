@@ -97,6 +97,20 @@ async def main() -> int:
     presses, _ = await run(steady(snap(weight=None), 0, 4000))
     check("a null weight is not an empty scale", presses, 0)
 
+    # Going offline ends the episode (evaluate calls _end_lockout_episode on that branch). The dwell
+    # has to restart on the way back: carried across an outage it would already be satisfied, and the
+    # first snapshot to return — the stale read the dwell exists to catch — would earn a press.
+    w = lw.Watcher(FakeRobot())
+    for t, s in steady(snap(), 0, 100):
+        await w.check_lockout(s, t)
+    w._end_lockout_episode()                                  # what the offline branch does
+    for t, s in steady(snap(), 100, 200):                     # back, still locked, 100s into a new dwell
+        await w.check_lockout(s, t)
+    check("an outage restarts the dwell", w.robot.presses, 0)
+    for t, s in steady(snap(), 200, 260):                     # and it presses once the new dwell is served
+        await w.check_lockout(s, t)
+    check("and presses once that dwell is served", w.robot.presses, 1)
+
     # Clearing ends the episode, so a later lockout serves its own dwell rather than pressing at once.
     presses, _ = await run(steady(snap(), 0, 400)
                            + steady(snap(code="DC_MODE_IDLE"), 400, 500)

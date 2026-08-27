@@ -527,7 +527,12 @@ class Watcher:
 
             # --- Offline failsafe (Mode A): alert if the robot is unreachable ---
             if not snap["online"]:
-                self._end_scale_episode()   # a stale reading proves nothing; start over when it returns
+                # A stale reading proves nothing; start both episodes over when it returns. The lockout
+                # dwell especially: carried across an outage it would already be satisfied on
+                # reconnect, and press on the very first snapshot back — the stale-data case the dwell
+                # exists to catch.
+                self._end_scale_episode()
+                self._end_lockout_episode()
                 if self.offline_since is None:
                     self.offline_since = now
                 elif not self.offline_alerted and (now - self.offline_since) >= OFFLINE_ALERT_SECONDS:
