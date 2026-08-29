@@ -26,8 +26,8 @@ zero. The tare never begins (it waits on a non-zero reading) and the stall watch
 status, so the box sits dead with nothing looking at it. We press reset once the robot's own verdict
 has held over an empty scale.
 
-Failsafe: Telegram alert if the robot is unreachable; a healthchecks.io heartbeat
-so an external monitor catches a dead watcher. Reconnects on any failure.
+Failsafe: phone push (APNs via the status hub) if the robot is unreachable; a healthchecks.io
+heartbeat so an external monitor catches a dead watcher. Reconnects on any failure.
 
 Logging: one JSON line per event to stdout (fly logs) and a daily file under LOG_DIR.
 
@@ -69,7 +69,7 @@ WEIGHT_THRESHOLD = float(os.environ.get("WEIGHT_THRESHOLD_LB", 3.0))
 # oscillation). Notifications never stop the retries.
 RESET_RETRY_SECONDS = float(os.environ.get("RESET_RETRY_SECONDS", 30))       # min gap between reset presses
 STALL_CONFIRM_SECONDS = float(os.environ.get("STALL_CONFIRM_SECONDS", 30))   # stall must hold an empty scale this long before the FIRST press
-STUCK_ALERT_SECONDS = float(os.environ.get("STUCK_ALERT_SECONDS", 600))      # first Telegram after stuck this long
+STUCK_ALERT_SECONDS = float(os.environ.get("STUCK_ALERT_SECONDS", 600))      # first alert after stuck this long
 STUCK_REALERT_SECONDS = float(os.environ.get("STUCK_REALERT_SECONDS", 1800)) # remind this often while still stuck
 
 # ---- Phantom weight (a scale that never returns to zero) -------------------------------------------
@@ -121,16 +121,13 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 # Failsafe / alerting
 OFFLINE_ALERT_SECONDS = float(os.environ.get("OFFLINE_ALERT_SECONDS", 180))   # robot offline this long -> high-priority alert
 # High-priority phone push via the status-hub app (APNs). Same /api/notify the voice worker uses; the
-# token is the hub's TV_TOKEN. When both are set, offline / sleep-dropped alerts fan out to the app AND
-# Telegram so a dropped connection or a lost sleep-mode can't go unnoticed.
+# token is the hub's TV_TOKEN. Every alert (offline, sleep dropped, stuck, drawer, scale) goes here.
 HUB_NOTIFY_URL = os.environ.get("HUB_NOTIFY_URL", "")
 HUB_NOTIFY_TOKEN = os.environ.get("HUB_NOTIFY_TOKEN", "")
 # The dead-man ping is fed once per connection cycle (see RECONNECT_EVERY_S), so it needs no interval
 # of its own. device_status does: the hub's litter card is only as fresh as our last write, and writing
 # it solely on a status change left the card reading hours stale whenever the robot sat idle.
 PUBLISH_SECONDS = float(os.environ.get("PUBLISH_SECONDS", 600))               # refresh device_status at least this often
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 HEALTHCHECKS_URL = os.environ.get("HEALTHCHECKS_URL", "")
 
 # Publish robot status to Supabase (device_status table) for the status hub to read.
@@ -267,20 +264,6 @@ def litter_level_pct(snap: dict):
     return round(v * 100, 1) if v <= 1.5 else round(v, 1)
 
 
-async def send_telegram(text: str) -> None:
-    """Best-effort Telegram message via the @jaredpi_bot. Never raises."""
-    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
-        return
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
-            )
-    except Exception as ex:
-        log_event("telegram_error", error=str(ex))
-
-
 async def push_app(title: str, body: str, kind: str = "litter") -> None:
     """Best-effort high-priority phone push through the status-hub app (APNs). Never raises."""
     if not (HUB_NOTIFY_URL and HUB_NOTIFY_TOKEN):
@@ -296,8 +279,8 @@ async def push_app(title: str, body: str, kind: str = "litter") -> None:
 
 
 async def notify(title: str, body: str, kind: str = "litter") -> None:
-    """High-priority alert -> BOTH the app (APNs push) and Telegram, so it can't be missed. Never raises."""
-    await asyncio.gather(push_app(title, body, kind), send_telegram(f"{title}\n{body}"))
+    """High-priority alert -> the phone (APNs push through the hub). Never raises."""
+    await push_app(title, body, kind)
 
 
 async def heartbeat() -> None:
@@ -447,7 +430,7 @@ class Watcher:
         self.stuck_since = None       # monotonic time the current stuck episode began
         self.last_press = None        # monotonic time of our last reset press
         self.press_count = 0          # reset presses issued this episode (logging)
-        self.last_stuck_alert = None  # monotonic time of the last "still stuck" Telegram
+        self.last_stuck_alert = None  # monotonic time of the last "still stuck" alert
         self.holding_logged = False   # logged "cat present, holding" once this episode
         self.controlling = False      # are we currently overriding the closet light?
         self.saved_light = None       # user's light state, captured before we took over
@@ -565,7 +548,7 @@ class Watcher:
             #      and clears itself well within that window; only a genuine stall stays static. This is
             #      what stops us spinning the box on a cat, and why we never reset on a mere CAT_DETECTED.
             # Once confirmed, retry every RESET_RETRY_SECONDS (spaced past the robot's ~10-15s response
-            # lag so we never re-press mid-landing) until it clears — indefinitely. Telegram fires after
+            # lag so we never re-press mid-landing) until it clears — indefinitely. The stuck alert fires after
             # STUCK_ALERT_SECONDS, then every STUCK_REALERT_SECONDS, without ever halting the retries.
             w = snap.get("weight") or 0
             if needs_reset(status):
@@ -595,9 +578,9 @@ class Watcher:
                         self.last_stuck_alert = now
                         mins = int(held // 60)
                         log_event("stuck_alert", stuck_minutes=mins, presses=self.press_count, **snap)
-                        await send_telegram(
-                            f"⚠️ Litter-Robot stuck ({status}) for {mins}+ min — auto-reset has tried "
-                            f"{self.press_count}× and is still retrying; may need a hands-on check.")
+                        await notify("⚠️ Litter-Robot stuck",
+                                     f"{status} for {mins}+ min — auto-reset has tried {self.press_count}× "
+                                     f"and is still retrying; may need a hands-on check.", "litter_stuck")
             else:
                 if self.stuck_since is not None and status in HEALTHY_STATES:
                     log_event("incident_cleared", presses=self.press_count, **snap)

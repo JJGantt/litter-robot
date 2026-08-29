@@ -82,7 +82,7 @@ Whisker's [light codes guide](https://www.litter-robot.com/support/article/litte
   never auto-cycles. A cat visit marks the box dirty; once the scale has been empty for
   `CLEAN_DWELL_S` the watcher starts the cycle itself. It refuses to cycle into a genuinely
   full drawer, and resumes the moment the drawer is emptied.
-- **Failsafes.** Alerts to the phone (APNs via the status hub) *and* Telegram if the robot
+- **Failsafes.** Alerts to the phone (APNs via the status hub) if the robot
   goes unreachable, drops out of sleep mode, fills its drawer, or gets a scale it cannot
   zero. A healthchecks.io ping, fed once per connection cycle, catches a dead watcher.
 - **Survives a half-open socket.** A stale `refresh()` that returns old data with no error
@@ -118,7 +118,7 @@ Environment variables (see `.env-litter`, not committed). The safety-critical on
 | `DRIVE_CLEANING` | 1 | Master switch for firing cleans ourselves; off leaves the box idle |
 | `CLEAN_DWELL_S` | 900 | Quiet time after the last visit before we fire a clean |
 | `CLEAN_MIN_GAP_S` | 120 | Never re-fire a clean within this of the last one |
-| `STUCK_ALERT_SECONDS` / `STUCK_REALERT_SECONDS` | 600 / 1800 | First Telegram on a stall, then how often to remind |
+| `STUCK_ALERT_SECONDS` / `STUCK_REALERT_SECONDS` | 600 / 1800 | First alert on a stall, then how often to remind |
 | `OFFLINE_ALERT_SECONDS` | 180 | Robot unreachable this long → high-priority alert |
 | `DRAWER_FULL_PCT` / `LITTER_LOW_PCT` | 90 / 75 | Thresholds behind the drawer-full and litter-low alerts |
 | `PUBLISH_SECONDS` | 600 | Refresh `device_status` at least this often |
