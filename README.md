@@ -79,9 +79,11 @@ Whisker's [light codes guide](https://www.litter-robot.com/support/article/litte
 ## What else it does
 
 - **Drives cleaning.** The robot is held in Sleep Mode (set once in the Whisker app) so it
-  never auto-cycles. A cat visit marks the box dirty; once the scale has been empty for
-  `CLEAN_DWELL_S` the watcher starts the cycle itself. It refuses to cycle into a genuinely
-  full drawer, and resumes the moment the drawer is emptied.
+  never auto-cycles. The robot's own cat-detect-pending flag marks the box dirty; `CLEAN_DWELL_S`
+  after the last visit the watcher starts the cycle itself, and the cycle clears the flag. The
+  live scale is never published to the cloud and the recorded pet weight covers only some visits,
+  so the flag is the trigger and the weight record only refreshes the dwell. It refuses to cycle
+  into a genuinely full drawer, and resumes the moment the drawer is emptied.
 - **Failsafes.** Alerts to the phone (APNs via the status hub) if the robot
   goes unreachable, drops out of sleep mode, fills its drawer, or gets a scale it cannot
   zero. A healthchecks.io ping, fed once per connection cycle, catches a dead watcher.

@@ -32,9 +32,16 @@ you add a gate.
 ## The robot is held in Sleep Mode on purpose
 
 Solid purple is the normal resting colour here, not a fault. Sleep Mode is what stops the robot
-cycling on its own; the watcher fires every clean itself once the scale has been empty for
-`CLEAN_DWELL_S`. Taking the robot out of Sleep Mode in the Whisker app breaks the model this code is
-built on, and the watcher will alert about it.
+cycling on its own; the watcher fires every clean itself `CLEAN_DWELL_S` after the robot's
+`isCatDetectPending` flag reports a visit. Taking the robot out of Sleep Mode in the Whisker app
+breaks the model this code is built on, and the watcher will alert about it.
+
+## The cloud never carries the live scale
+
+`weightSensor` in Whisker's state document reads 0.0 with a cat, or 10 lb of iron, on the scale,
+asleep or awake (measured 2026-08-29). It is only ever non-zero as a reading stuck after a cycle,
+which is all the tare and lockout paths use it for. Do not add a trigger, a gate, or a test that
+expects it to show an animal; `test_visit.py` states what the visit trigger may rely on instead.
 
 ## Pushing deploys — and a restart costs state
 

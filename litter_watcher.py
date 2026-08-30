@@ -107,11 +107,21 @@ LOCKOUT_ALERT_AFTER = int(os.environ.get("LOCKOUT_ALERT_AFTER", 3))             
 
 # ---- Usage-driven cleaning -----------------------------------------------------------------------
 # The robot is kept in SLEEP mode (set once in the Whisker app) so it never auto-cycles; WE fire the
-# clean. After a cat visit, wait CLEAN_DWELL_S from the LAST visit (a new visit inside the window
-# restarts the clock), then start_cleaning() — but ONLY while online + sleeping + idle, so a lost
-# connection just parks it idle (never a stuck offline cycle). The existing stall watcher still
-# rescues any stall from the cycle we fire. If the robot ever leaves sleep mode we alert (the sleep
-# schedule can't be set back via the API — its write reverts — so it's monitored, not auto-repaired).
+# clean. A visit is the robot's own isCatDetectPending flag going true — its verdict that a cat used
+# the box and a cycle is owed, which sleep mode stops it acting on. Wait CLEAN_DWELL_S from the LAST
+# visit, then start_cleaning() — but ONLY while online + sleeping + idle, so a lost connection just
+# parks it idle (never a stuck offline cycle). The existing stall watcher still rescues any stall from
+# the cycle we fire. If the robot ever leaves sleep mode we alert (the sleep schedule can't be set via
+# the API — that write reverts — so it's monitored, not auto-repaired).
+#
+# Why the flag and nothing else (measured 2026-08-29/30, asleep and awake): the cloud copy of the
+# live scale (weightSensor) is never published — 10 lb sat on the scale for 8 minutes and every
+# read said 0.0 — and the CAT_DETECTED status only appears while awake. The recorded pet weight
+# (catWeight) is a side effect of the same detection that the SmartScale scores for roughly half of
+# visits; four real visits in 42 hours produced no record at all. It stays as a secondary trigger
+# because when it does fire it refreshes the dwell (the flag is a boolean, so a second cat inside the
+# window is otherwise invisible). The robot clears the flag when any cycle starts, ours or a button
+# press, so the falling edge means "clean" and re-arms the next visit with no bookkeeping.
 CLEAN_DWELL_S = float(os.environ.get("CLEAN_DWELL_S", 15 * 60))    # min quiet after the last visit
 CLEAN_MIN_GAP_S = float(os.environ.get("CLEAN_MIN_GAP_S", 120))    # never re-fire within this of the last clean
 DRIVE_CLEANING = os.environ.get("DRIVE_CLEANING", "1") not in ("0", "false", "off", "no", "")
@@ -249,6 +259,7 @@ def snapshot(robot) -> dict:
         "online": robot.is_online,
         "is_sleeping": bool(getattr(robot, "is_sleeping", False)),
         "catWeight": d.get("catWeight"),
+        "catDetectPending": d.get("isCatDetectPending"),
         # The raw firmware display code — what the light bar is actually showing. pylitterbot only
         # maps one value of it into .status, so anything else (the phantom-weight trip included) is
         # invisible in `status` alone. Carried so the LED state lands in the durable log.
@@ -440,9 +451,10 @@ class Watcher:
         self.offline_alerted = False
         self.last_online_status = None
         # usage-driven clean-trigger state
-        self.dirty = False            # a cat has used the box since our last clean
-        self.last_present = None      # monotonic time a cat was last on the scale / a visit was seen
-        self.last_cat_weight = None   # last recorded pet weight (a change = a completed visit)
+        self.dirty = False            # a cat has used the box since the last cycle
+        self.last_present = None      # monotonic time a visit was last seen (the dwell counts from here)
+        self.last_pending = None      # last isCatDetectPending read (None = no read yet this process)
+        self.last_cat_weight = None   # last recorded pet weight (a change = a visit the SmartScale scored)
         self.last_clean_fired = None  # monotonic time we last issued start_cleaning()
         self.not_sleeping_alerted = False  # alerted that the robot dropped out of sleep mode
         self.drawer_full_since = None      # monotonic time the waste drawer first read full
@@ -743,9 +755,23 @@ class Watcher:
                          "litter_lockout")
 
     async def maybe_clean(self, snap: dict, now: float) -> None:
-        """Fire a clean while the robot is held in sleep mode (no auto-cycle). A cat visit marks the
-        box dirty; once the scale has been empty for CLEAN_DWELL_S since the last visit and we're
+        """Fire a clean while the robot is held in sleep mode (no auto-cycle). The robot's own
+        cat-detect-pending flag marks the box dirty; CLEAN_DWELL_S after the last visit, while
         online + sleeping + idle, WE start the cycle (the stall watcher then rescues any stall)."""
+        # Track the flag in every mode: awake the robot clears it itself, and a visit that lands while
+        # awake is the robot's to clean; what matters is that the edge is known once sleep resumes.
+        pending = snap.get("catDetectPending")
+        if pending is not None:
+            if pending and not self.last_pending:
+                # None -> True: this process's first read finds a visit already owed (a redeploy or a
+                # crash mid-dwell). Its age is unknown, so the dwell runs from now.
+                self.dirty = True
+                self.last_present = now
+                log_event("visit", source="pending_at_start" if self.last_pending is None else "pending", **snap)
+            elif self.last_pending and not pending:
+                self.dirty = False   # a cycle started (ours or a button press): nothing is owed now
+            self.last_pending = pending
+
         if not snap.get("is_sleeping"):
             # Suppression dropped — the robot will auto-cycle on its own. Alert once (can't set via API).
             if not self.not_sleeping_alerted:
@@ -780,21 +806,24 @@ class Watcher:
             self.drawer_full_since = None
             self.last_drawer_alert = None
 
-        w = snap.get("weight") or 0
         cw = snap.get("catWeight")
         status = snap["status"]
         new_weight = (self.last_cat_weight is not None and cw is not None and cw != self.last_cat_weight)
         if cw is not None:
             self.last_cat_weight = cw
-
-        # A cat on the scale, a cat-detect status, or a freshly recorded pet weight = the box got used.
-        if (w and w > WEIGHT_THRESHOLD) or status in ("CAT_DETECTED", "CAT_SENSOR_TIMING") or new_weight:
-            self.dirty = True
+        if new_weight:
+            # The SmartScale scored a visit. Secondary: it restarts the dwell (a second cat inside the
+            # window), and it marks dirty on its own only while the robot also holds a visit pending.
             self.last_present = now
-            return  # never cycle while a cat is (or just was) there — the "don't spin on a cat" rule
+            if pending is not False:
+                self.dirty = True
+            log_event("visit", source="weight_record", **snap)
+            return  # a cat was just there — never cycle inside the dwell
 
         if drawer_full:
             return  # drawer full: a clean is pending (dirty stays set) but we won't fire until it's emptied
+        if pending is False:
+            return  # the robot says nothing is owed (it just cycled, or someone pressed the button)
 
         # DRAWER_FULL is fire-able on purpose: the robot's drawer-full FLAG trips early (seen at 53%
         # depth) yet the box still cycles fine — the real overpack limit is the depth guard above. Only
