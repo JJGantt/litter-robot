@@ -90,9 +90,13 @@ Whisker's [light codes guide](https://www.litter-robot.com/support/article/litte
 - **Survives a half-open socket.** A stale `refresh()` that returns old data with no error
   once left the watcher silently blind for a day, so the whole Whisker connection is recycled
   every `RECONNECT_EVERY_S` and every call has a timeout.
-- **Publishes status** to Supabase `device_status` for the hub's litter card, at least every
-  `PUBLISH_SECONDS` — not only on a state change, which used to leave the card reading hours
-  stale through any quiet stretch.
+- **Publishes status** to Supabase `device_status` for the hub's litter card, on any change and
+  at least every `PUBLISH_SECONDS` (a timer alone left the card reading hours stale through a
+  quiet stretch). The row's `data` carries what the WATCHER is doing — `driving`, `sleeping`,
+  `clean_pending`, `clean_due_at`, `last_visit_at`, `last_clean_at`, `blocked`, `locked_out`,
+  `scale_stuck`, `resetting`, `display_code` — because the robot's own `status` reads `READY`
+  through a queued clean, a phantom weight and a lockout alike, and a card painting `status`
+  alone shows an idle robot in every one of them.
 - **Durable log.** Every meaningful event is mirrored to Supabase `litter_events` (the
   on-disk log is wiped by each Fly redeploy). The robot's raw `displayCode` — the light bar —
   is carried in the snapshot and logged on change, so what the panel was showing is

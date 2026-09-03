@@ -45,6 +45,7 @@ Config (env, with defaults):
 import asyncio
 import json
 import os
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -187,6 +188,14 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
+def iso_at(epoch: "float | None") -> "str | None":
+    """Wall-clock ISO for an epoch seconds value. The watcher times everything on the event loop's
+    monotonic clock (immune to NTP steps), but the hub needs a real timestamp to count down from."""
+    if epoch is None:
+        return None
+    return datetime.fromtimestamp(epoch, timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
 def log_event(event: str, **fields) -> None:
     rec = {"ts": now_iso(), "event": event, **fields}
     print(json.dumps(rec), flush=True)
@@ -305,23 +314,17 @@ async def heartbeat() -> None:
         log_event("heartbeat_error", error=str(ex))
 
 
-async def publish_status(serial: str, snap: dict) -> None:
-    """Upsert the robot's current status to Supabase (device_status) for the hub. Never raises."""
+async def publish_row(row: dict) -> None:
+    """Upsert one device_status row to Supabase for the hub to read. Never raises."""
     if not (SUPABASE_URL and SUPABASE_KEY):
         return
-    litter_pct = litter_level_pct(snap)
-    row = {
-        "device": serial, "name": "Litter-Robot 4", "status": snap.get("status"),
-        "litter_level_pct": litter_pct, "waste_drawer_pct": snap.get("drawerPct"),
-        "online": snap.get("online"), "updated_at": now_iso(),
-    }
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             await client.post(
                 f"{SUPABASE_URL}/rest/v1/device_status?on_conflict=device",
                 headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
                          "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates"},
-                json=row,
+                json={**row, "updated_at": now_iso()},
             )
     except Exception as ex:
         log_event("publish_error", error=str(ex))
@@ -453,9 +456,11 @@ class Watcher:
         # usage-driven clean-trigger state
         self.dirty = False            # a cat has used the box since the last cycle
         self.last_present = None      # monotonic time a visit was last seen (the dwell counts from here)
+        self.last_visit_at = None     # same instant in epoch seconds, for the hub's countdown
         self.last_pending = None      # last isCatDetectPending read (None = no read yet this process)
         self.last_cat_weight = None   # last recorded pet weight (a change = a visit the SmartScale scored)
         self.last_clean_fired = None  # monotonic time we last issued start_cleaning()
+        self.last_clean_at = None     # epoch seconds a cycle last began (ours or a button press)
         self.not_sleeping_alerted = False  # alerted that the robot dropped out of sleep mode
         self.drawer_full_since = None      # monotonic time the waste drawer first read full
         self.last_drawer_alert = None      # monotonic time of the last drawer-full alert
@@ -475,6 +480,7 @@ class Watcher:
         self.lockout_alerted = False       # already asked for a human this episode
         self.lockout_flagged = False       # locked out right now (drives the closet light)
         self.last_publish = None           # monotonic time device_status was last written
+        self.published = None              # the row body last written (a change re-publishes at once)
 
     async def evaluate(self) -> None:
         # Single-flight: if an evaluation/reset is already in progress, skip;
@@ -490,13 +496,6 @@ class Watcher:
             if status != self.last_status:
                 log_event("status", **snap)
                 self.last_status = status
-                await publish_status(self.robot.serial, snap)
-                self.last_publish = now
-            elif self.last_publish is None or (now - self.last_publish) >= PUBLISH_SECONDS:
-                # Keep the hub's card honest even through a long idle stretch — otherwise its
-                # "last updated" is the last time the robot happened to change state.
-                await publish_status(self.robot.serial, snap)
-                self.last_publish = now
 
             # The display code is the light bar. Log every change: it is the only record of what the
             # robot was showing, and most of its values never reach `status` at all.
@@ -540,6 +539,7 @@ class Watcher:
                                  f"Check the robot / router.",
                                  "litter_offline")
                     self.offline_alerted = True
+                await self.publish_state(snap, now)
                 return
             else:
                 if self.offline_alerted:
@@ -616,6 +616,51 @@ class Watcher:
             # auto-cycles. Runs only when online (offline returns above), so a drop just parks it idle. ----
             if DRIVE_CLEANING:
                 await self.maybe_clean(snap, now)
+
+            # Last: the driver state published below is read from the flags every check above sets,
+            # so publishing earlier would ship the previous poll's verdict.
+            await self.publish_state(snap, now)
+
+    def driver_state(self, snap: dict) -> dict:
+        """What the WATCHER is doing — none of which the robot's own status reports. Held in sleep
+        mode the box reads READY through a queued clean, a phantom weight and a 30-minute lockout
+        alike, so a hub painting `status` alone shows an idle robot in every one of them."""
+        sleeping = bool(snap.get("is_sleeping"))
+        drawer = snap.get("drawerPct") or 0
+        return {
+            # driving is the whole model: sleep mode is what stops the robot cycling on its own, so
+            # out of it the watcher is a bystander and the box is running itself.
+            "driving": bool(DRIVE_CLEANING and sleeping),
+            "sleeping": sleeping,
+            "clean_pending": bool(self.dirty),
+            "clean_due_at": (iso_at(self.last_visit_at + CLEAN_DWELL_S)
+                             if self.dirty and self.last_visit_at is not None else None),
+            "last_visit_at": iso_at(self.last_visit_at),
+            "last_clean_at": iso_at(self.last_clean_at),
+            # A pending clean survives a full drawer — it fires the moment the drawer is emptied —
+            # so the block is carried beside it rather than clearing it.
+            "blocked": "drawer_full" if drawer >= DRAWER_FULL_PCT else None,
+            "locked_out": bool(self.lockout_flagged),
+            "scale_stuck": bool(self.scale_flagged),
+            "resetting": bool(self.press_count),
+            "display_code": snap.get("displayCode"),
+        }
+
+    async def publish_state(self, snap: dict, now: float) -> None:
+        """Mirror robot + driver state to device_status: on any change, and at least every
+        PUBLISH_SECONDS. Change-driven because a driven clean's whole life — visit, dwell, cycle —
+        fits inside one refresh interval, and a card that only refreshes on a timer misses it."""
+        row = {
+            "device": self.robot.serial, "name": "Litter-Robot 4", "status": snap.get("status"),
+            "litter_level_pct": litter_level_pct(snap), "waste_drawer_pct": snap.get("drawerPct"),
+            "online": snap.get("online"), "data": self.driver_state(snap),
+        }
+        if (row == self.published and self.last_publish is not None
+                and (now - self.last_publish) < PUBLISH_SECONDS):
+            return
+        await publish_row(row)
+        self.published = row
+        self.last_publish = now
 
     def _end_scale_episode(self) -> None:
         self.scale_since = None
@@ -767,9 +812,11 @@ class Watcher:
                 # crash mid-dwell). Its age is unknown, so the dwell runs from now.
                 self.dirty = True
                 self.last_present = now
+                self.last_visit_at = time.time()
                 log_event("visit", source="pending_at_start" if self.last_pending is None else "pending", **snap)
             elif self.last_pending and not pending:
                 self.dirty = False   # a cycle started (ours or a button press): nothing is owed now
+                self.last_clean_at = time.time()   # the robot's own confirmation that one began
             self.last_pending = pending
 
         if not snap.get("is_sleeping"):
@@ -815,6 +862,7 @@ class Watcher:
             # The SmartScale scored a visit. Secondary: it restarts the dwell (a second cat inside the
             # window), and it marks dirty on its own only while the robot also holds a visit pending.
             self.last_present = now
+            self.last_visit_at = time.time()
             if pending is not False:
                 self.dirty = True
             log_event("visit", source="weight_record", **snap)
