@@ -96,7 +96,9 @@ Whisker's [light codes guide](https://www.litter-robot.com/support/article/litte
   `clean_pending`, `clean_due_at`, `last_visit_at`, `last_clean_at`, `blocked`, `locked_out`,
   `scale_stuck`, `resetting`, `display_code` — because the robot's own `status` reads `READY`
   through a queued clean, a phantom weight and a lockout alike, and a card painting `status`
-  alone shows an idle robot in every one of them.
+  alone shows an idle robot in every one of them. The two timestamps are seeded from
+  `litter_events` on connect: episode state is memory-only, so a redeploy would otherwise blank
+  them until the next cat.
 - **Durable log.** Every meaningful event is mirrored to Supabase `litter_events` (the
   on-disk log is wiped by each Fly redeploy). The robot's raw `displayCode` — the light bar —
   is carried in the snapshot and logged on change, so what the panel was showing is

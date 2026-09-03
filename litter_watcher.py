@@ -646,6 +646,32 @@ class Watcher:
             "display_code": snap.get("displayCode"),
         }
 
+    async def seed_history(self) -> None:
+        """Recover last-visit / last-clean from the durable log at startup. Episode state is memory
+        only, so every redeploy otherwise blanks the hub's "used" time until the next cat — the one
+        thing that card is asked for. Display only: the dwell runs off its own monotonic clock, and
+        whether a clean is owed comes from the robot's pending flag, never from these."""
+        if not (SUPABASE_URL and SUPABASE_KEY):
+            return
+        headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+        # A cycle START is a `status` event reading CLEAN_CYCLE — that catches a button press as well
+        # as our own drive_clean, which is the same thing the in-memory stamp records.
+        wanted = (("last_visit_at", "event=eq.visit"),
+                  ("last_clean_at", "event=eq.status&status=eq.CLEAN_CYCLE"))
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                for field, query in wanted:
+                    if getattr(self, field) is not None:
+                        continue   # a live event already beat us to it
+                    r = await client.get(
+                        f"{SUPABASE_URL}/rest/v1/litter_events?select=ts&{query}"
+                        f"&device=eq.{self.robot.serial}&order=ts.desc&limit=1", headers=headers)
+                    rows = r.json() if r.status_code < 300 else []
+                    if rows:
+                        setattr(self, field, datetime.fromisoformat(rows[0]["ts"]).timestamp())
+        except Exception as ex:
+            log_event("seed_error", error=str(ex))
+
     async def publish_state(self, snap: dict, now: float) -> None:
         """Mirror robot + driver state to device_status: on any change, and at least every
         PUBLISH_SECONDS. Change-driven because a driven clean's whole life — visit, dwell, cycle —
@@ -939,6 +965,7 @@ async def run_once(watcher: "Watcher") -> None:
         log_event("startup", serial=robot.serial, slow_poll=SLOW_POLL,
                   fast_poll=FAST_POLL, weight_threshold=WEIGHT_THRESHOLD)
         await load_diy_scenes()   # resolve scene names -> ids before we may trigger one
+        await watcher.seed_history()   # before the first publish, so the card is never blank
         await asyncio.wait_for(robot.refresh(), REFRESH_TIMEOUT)
         await watcher.evaluate()  # act on current state immediately
         # Feed the dead-man's switch once per connection. That is the whole cadence: this function
