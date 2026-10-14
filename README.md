@@ -68,7 +68,7 @@ Whisker's [light codes guide](https://www.litter-robot.com/support/article/litte
 |---|---|---|
 | **Solid purple** | Sleep Mode active | This is the normal resting colour here — the watcher deliberately keeps the robot asleep and fires cleans itself |
 | **Blue, partial yellow flashing** | Scale triggered 30+ min (`DC_CAT_DETECT_30M`) | Failures 2 and 3 above. The box will not cycle. Reset zeroes the scale |
-| **Blue flashing** | Waste drawer full | Empty it, press Reset |
+| **Blue flashing** | Waste drawer full | Empty it, then press Cycle — the reading only updates during a clean |
 | **Blue with one yellow blink by the Connect button** | Wi-Fi lost / onboarding | Not a reset fix — re-run Update Network in the Whisker app |
 | **Solid yellow** | Paused | |
 | **Yellow round-robin** | Clean or Empty cycle running | |
@@ -83,7 +83,12 @@ Whisker's [light codes guide](https://www.litter-robot.com/support/article/litte
   after the last visit the watcher starts the cycle itself, and the cycle clears the flag. The
   live scale is never published to the cloud and the recorded pet weight covers only some visits,
   so the flag is the trigger and the weight record only refreshes the dwell. It refuses to cycle
-  into a genuinely full drawer, and resumes the moment the drawer is emptied.
+  into a genuinely full drawer, and resumes once a clean measures the drawer below 80%.
+  **After emptying a full drawer, press Cycle.** The robot measures the drawer only during the
+  dump of a full clean cycle — emptying it, pressing Reset, or a cat-release motion (which the
+  Whisker app also logs as "Clean Cycle Complete") leaves the old reading in place. While that
+  reading is 90%+ the watcher will not start the clean that would correct it, so without a manual
+  cycle the box sits uncleaned indefinitely.
 - **Failsafes.** Alerts to the phone (APNs via the status hub) if the robot
   goes unreachable, drops out of sleep mode, fills its drawer, or gets a scale it cannot
   zero. A healthchecks.io ping, fed once per connection cycle, catches a dead watcher.
