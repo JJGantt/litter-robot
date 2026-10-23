@@ -29,6 +29,15 @@ gate removed in `check_lockout` fails the build rather than the animal. Run it d
 `python3 test_lockout.py` — it stubs its imports and needs nothing installed. Add a case there when
 you add a gate.
 
+## A stall the robot flagged a cat in is never pressed
+
+`check_stall` presses Reset on a halted cycle. A halted cycle is also exactly what a cat walking in
+on a cycle looks like, and the scale gate there cannot see it (see below). The robot's
+`isCatDetectPending` rising during the stall is the only cat signal available, so it latches the
+episode hands-off. Do not drop that gate or shorten `STALL_CONFIRM_SECONDS` below the time the flag
+takes to rise (16s measured) — a 30s press restarted the globe on a cat on 2026-10-23.
+`test_stall.py` pins it.
+
 ## The robot is held in Sleep Mode on purpose
 
 Solid purple is the normal resting colour here, not a fault. Sleep Mode is what stops the robot

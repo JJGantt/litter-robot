@@ -35,7 +35,7 @@ jobs:
         # This watcher presses a physical button on a machine with a cat in it. The gates that decide
         # when it may are stated as cases in test_lockout.py; run them before shipping, so one removed
         # fails here rather than in the globe. It stubs its imports, so there is nothing to install.
-        run: python3 test_lockout.py && python3 test_visit.py
+        run: python3 test_lockout.py && python3 test_visit.py && python3 test_stall.py
       - uses: superfly/flyctl-actions/setup-flyctl@master
       - run: flyctl deploy --remote-only
         env:

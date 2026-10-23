@@ -12,12 +12,18 @@ is doing.
 All three come from the same flaky part — the LR4's weight scale, and they fail in opposite
 directions, which is why each needs its own detector and why none of them can cover another.
 
-**1. A stall mid-cycle (empty scale).** The robot throws a false `CAT_SENSOR_INTERRUPTED`
-partway through a clean cycle: the scale reads ~0 (no cat), but the globe halts, open.
-The watcher confirms the scale is empty and has stayed empty for a dwell, then sends
-`shortResetPress` to resume, retrying on a spaced cadence until the cycle moves again. A real
-cat (weight present) is never touched. This happens *a lot* — 70+ presses in a recent 9-day
-window.
+**1. A stall mid-cycle.** The robot throws a false `CAT_SENSOR_INTERRUPTED` partway through a
+clean cycle and the globe halts, open. The watcher waits `STALL_CONFIRM_SECONDS`, then sends
+`shortResetPress` to resume, retrying on a spaced cadence until the cycle moves again. This happens
+*a lot* — 70+ presses in a recent 9-day window.
+
+The same halt is also what the robot does when a cat really walks in on a cycle, and the cloud's
+scale reading cannot tell the two apart (it reads 0.0 with a cat on it). The one difference that
+reaches the cloud is `isCatDetectPending`: the robot clears it as a cycle starts and raises it again
+within seconds when a cat arrives. If it is up at any point during a stall, the watcher never presses
+for that stall — the robot resumes on its own once the cat has left, and if it does not, the phone
+gets the stuck alert instead. Across ~390 stalls since late August it rose in about a dozen, so the
+false trips keep their rescue.
 
 **2. A phantom weight on an idle box (loaded scale).** The scale drifts off zero — a nudge, a
 foot caught on the mat, litter added, the drawer emptied — and the robot then believes a cat
@@ -57,7 +63,7 @@ there is nothing on it to spin; the globe is parked, so the press is a tare and 
 non-zero reading is handed straight back to detector 2 — the path that alerts instead of
 pressing when the weight wanders, which is what keeps a cat that has settled in for the
 afternoon safe. `test_lockout.py` states each of those gates as a case, and the deploy workflow
-runs it before it ships.
+runs it before it ships; `test_stall.py` does the same for failure 1.
 
 ## Litter-Robot 4 light codes worth knowing
 
@@ -122,7 +128,7 @@ Environment variables (see `.env-litter`, not committed). The safety-critical on
 | `MAX_FAST_SECONDS` | 600 | Stop fast-polling after this long |
 | `WEIGHT_THRESHOLD_LB` | 3.0 | Max weight treated as "no cat" |
 | `RESET_RETRY_SECONDS` | 30 | Min gap between reset presses on a stall |
-| `STALL_CONFIRM_SECONDS` | 30 | Stall must hold an empty scale this long before the first press |
+| `STALL_CONFIRM_SECONDS` | 60 | Stall must hold this long, with no cat flagged, before the first press |
 | `SCALE_ZERO_TOL` | 0.2 | \|lb\| below this counts as a zeroed scale |
 | `SCALE_STUCK_SECONDS` | 1800 | Non-zero scale on an idle box this long → auto-tare |
 | `SCALE_STATIC_TOL` | 0.25 | Max peak-to-peak lb across that window to still call it a drift |

@@ -62,14 +62,14 @@ FAST_POLL = float(os.environ.get("FAST_POLL_SECONDS", 1))    # while a cycle is 
 MAX_FAST_SECONDS = float(os.environ.get("MAX_FAST_SECONDS", 600))  # cap on continuous fast-polling
 WEIGHT_THRESHOLD = float(os.environ.get("WEIGHT_THRESHOLD_LB", 3.0))
 
-# Auto-reset cadence: a stall (mid-cycle CAT_SENSOR_INTERRUPTED / PAUSED) must first hold a continuously
-# empty scale for STALL_CONFIRM_SECONDS — that dwell is what keeps a normal (transient) cat visit from
-# ever being touched; only a genuine stall persists that long. Once confirmed, retry every
+# Auto-reset cadence: a stall (mid-cycle CAT_SENSOR_INTERRUPTED / PAUSED) must first hold for
+# STALL_CONFIRM_SECONDS with no cat flagged by the robot (see check_stall for the gates — the scale
+# alone cannot see a cat). Once confirmed, retry every
 # RESET_RETRY_SECONDS until it recovers — indefinitely, not a fixed number of tries. The spacing stays
 # well above the robot's ~10-15s response lag so a press is never re-issued mid-landing (the old
 # oscillation). Notifications never stop the retries.
 RESET_RETRY_SECONDS = float(os.environ.get("RESET_RETRY_SECONDS", 30))       # min gap between reset presses
-STALL_CONFIRM_SECONDS = float(os.environ.get("STALL_CONFIRM_SECONDS", 30))   # stall must hold an empty scale this long before the FIRST press
+STALL_CONFIRM_SECONDS = float(os.environ.get("STALL_CONFIRM_SECONDS", 60))   # stall must hold this long before the FIRST press
 STUCK_ALERT_SECONDS = float(os.environ.get("STUCK_ALERT_SECONDS", 600))      # first alert after stuck this long
 STUCK_REALERT_SECONDS = float(os.environ.get("STUCK_REALERT_SECONDS", 1800)) # remind this often while still stuck
 
@@ -446,6 +446,7 @@ class Watcher:
         self.press_count = 0          # reset presses issued this episode (logging)
         self.last_stuck_alert = None  # monotonic time of the last "still stuck" alert
         self.holding_logged = False   # logged "cat present, holding" once this episode
+        self.cat_in_stall = False     # the robot flagged a cat during this stall: never press it
         self.controlling = False      # are we currently overriding the closet light?
         self.saved_light = None       # user's light state, captured before we took over
         self.last_override = None     # current override color while controlling
@@ -551,56 +552,7 @@ class Watcher:
                 self.offline_alerted = False
                 self.last_online_status = status
 
-            # Auto-reset ONLY a cycle that started but stalled mid-way (CAT_SENSOR_INTERRUPTED /
-            # PAUSED). Two gates before we ever press:
-            #   1. Empty scale — any weight is a real cat, so we never touch it and we restart the
-            #      confirm clock (so time spent with a cat on the scale never counts toward a reset).
-            #   2. Persistence — the stall must hold that empty scale continuously for
-            #      STALL_CONFIRM_SECONDS before the FIRST press. A normal cat interaction is transient
-            #      and clears itself well within that window; only a genuine stall stays static. This is
-            #      what stops us spinning the box on a cat, and why we never reset on a mere CAT_DETECTED.
-            # Once confirmed, retry every RESET_RETRY_SECONDS (spaced past the robot's ~10-15s response
-            # lag so we never re-press mid-landing) until it clears — indefinitely. The stuck alert fires after
-            # STUCK_ALERT_SECONDS, then every STUCK_REALERT_SECONDS, without ever halting the retries.
-            w = snap.get("weight") or 0
-            if needs_reset(status):
-                if w > WEIGHT_THRESHOLD:
-                    # A cat is on the scale mid-stall -> real cat, never reset. Restart the confirm
-                    # clock so that once it leaves we re-confirm an empty scale from scratch.
-                    self.stuck_since = None
-                    self.last_press = None
-                    if not self.holding_logged:
-                        log_event("hold_weight_present", **snap)
-                        self.holding_logged = True
-                else:
-                    if self.stuck_since is None:
-                        self.stuck_since = now
-                    held = now - self.stuck_since
-                    if held >= STALL_CONFIRM_SECONDS and (
-                            self.last_press is None or (now - self.last_press) >= RESET_RETRY_SECONDS):
-                        self.last_press = now   # record BEFORE the press so spacing holds even if reset() throws
-                        self.press_count += 1
-                        log_event("reset_press", attempt=self.press_count, stuck_for=round(held), **snap)
-                        try:
-                            await self.robot.reset()
-                        except Exception as ex:
-                            log_event("reset_error", error=str(ex))
-                    if held >= STUCK_ALERT_SECONDS and (self.last_stuck_alert is None
-                            or (now - self.last_stuck_alert) >= STUCK_REALERT_SECONDS):
-                        self.last_stuck_alert = now
-                        mins = int(held // 60)
-                        log_event("stuck_alert", stuck_minutes=mins, presses=self.press_count, **snap)
-                        await notify("⚠️ Litter-Robot stuck",
-                                     f"{status} for {mins}+ min — auto-reset has tried {self.press_count}× "
-                                     f"and is still retrying; may need a hands-on check.", "litter_stuck")
-            else:
-                if self.stuck_since is not None and status in HEALTHY_STATES:
-                    log_event("incident_cleared", presses=self.press_count, **snap)
-                self.stuck_since = None
-                self.last_press = None
-                self.press_count = 0
-                self.last_stuck_alert = None
-                self.holding_logged = False
+            await self.check_stall(snap, now)
 
             # ---- Phantom weight: an idle box whose scale never came back to zero. Left alone it
             # trips the robot's own 30-minute lockout (blue bar, partial yellow flashing) and the box
@@ -687,6 +639,75 @@ class Watcher:
         await publish_row(row)
         self.published = row
         self.last_publish = now
+
+    async def check_stall(self, snap: dict, now: float) -> None:
+        """Auto-reset ONLY a cycle that started but stalled mid-way (CAT_SENSOR_INTERRUPTED / PAUSED).
+        Three gates before we ever press:
+          1. No cat flagged by the robot — isCatDetectPending going true at any point in the stall.
+             The robot clears that flag when a cycle starts, so true mid-cycle means it registered a
+             cat arriving, and the episode is latched hands-off: the robot resumes on its own once
+             the cat has gone, and if it never does a human is alerted, never a press. This is the
+             only live cat signal the cloud carries while asleep (see CLAUDE.md); the weight gate
+             below cannot see an animal. A cat that walks in on a cycle is this case, and a 30s
+             press without this gate restarted the globe on one (2026-10-23 13:40Z).
+          2. Empty scale — kept, but it only ever sees a stuck reading, never a cat.
+          3. Persistence — the stall must hold for STALL_CONFIRM_SECONDS before the FIRST press.
+             The robot raises the pending flag some seconds after it halts (16s on 2026-10-23), so
+             this dwell is also what gives gate 1 time to see it.
+        Once confirmed, retry every RESET_RETRY_SECONDS (spaced past the robot's ~10-15s response
+        lag so we never re-press mid-landing) until it clears — indefinitely. The stuck alert fires
+        after STUCK_ALERT_SECONDS, then every STUCK_REALERT_SECONDS, without ever halting the retries."""
+        status = snap["status"]
+        w = snap.get("weight") or 0
+        if not needs_reset(status):
+            if self.stuck_since is not None and status in HEALTHY_STATES:
+                log_event("incident_cleared", presses=self.press_count, cat=self.cat_in_stall, **snap)
+            self.stuck_since = None
+            self.last_press = None
+            self.press_count = 0
+            self.last_stuck_alert = None
+            self.holding_logged = False
+            self.cat_in_stall = False
+            return
+
+        if snap.get("catDetectPending") and not self.cat_in_stall:
+            self.cat_in_stall = True
+            log_event("hold_cat_pending", **snap)
+
+        if w > WEIGHT_THRESHOLD:
+            # A cat is on the scale mid-stall -> real cat, never reset. Restart the confirm
+            # clock so that once it leaves we re-confirm an empty scale from scratch.
+            self.stuck_since = None
+            self.last_press = None
+            if not self.holding_logged:
+                log_event("hold_weight_present", **snap)
+                self.holding_logged = True
+            return
+
+        if self.stuck_since is None:
+            self.stuck_since = now
+        held = now - self.stuck_since
+        if not self.cat_in_stall and held >= STALL_CONFIRM_SECONDS and (
+                self.last_press is None or (now - self.last_press) >= RESET_RETRY_SECONDS):
+            self.last_press = now   # record BEFORE the press so spacing holds even if reset() throws
+            self.press_count += 1
+            log_event("reset_press", attempt=self.press_count, stuck_for=round(held), **snap)
+            try:
+                await self.robot.reset()
+            except Exception as ex:
+                log_event("reset_error", error=str(ex))
+        if held >= STUCK_ALERT_SECONDS and (self.last_stuck_alert is None
+                or (now - self.last_stuck_alert) >= STUCK_REALERT_SECONDS):
+            self.last_stuck_alert = now
+            mins = int(held // 60)
+            log_event("stuck_alert", stuck_minutes=mins, presses=self.press_count, cat=self.cat_in_stall, **snap)
+            if self.cat_in_stall:
+                # TODO(copy): Jared to word this one; values only until then.
+                body = f"{status} · {mins} min · cat detected · no auto-reset"
+            else:
+                body = (f"{status} for {mins}+ min — auto-reset has tried {self.press_count}× "
+                        f"and is still retrying; may need a hands-on check.")
+            await notify("⚠️ Litter-Robot stuck", body, "litter_stuck")
 
     def _end_scale_episode(self) -> None:
         self.scale_since = None
