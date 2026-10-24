@@ -115,6 +115,35 @@ Whisker's [light codes guide](https://www.litter-robot.com/support/article/litte
   is carried in the snapshot and logged on change, so what the panel was showing is
   recoverable after the fact.
 
+## Camera gate — decided, not built yet
+
+The pending flag (failure 1) only covers a cat that arrives *during* a stall. It cannot see a second
+cat that walks in during the 15-minute dwell after a first one, because the flag is already up and
+nothing changes. That gap spun a cat on 2026-10-23. No robot command clears the flag without starting
+a cycle (the LR4 command set is cleanCycle, shortResetPress, power, night light, panel lock,
+brightness, clump time), so the robot alone cannot close it.
+
+The decision (2026-10-24): before every `drive_clean` and every stall `shortResetPress`, take a still
+from a camera facing the box and have an LLM judge whether a cat is in or on it. If it sees a cat, or
+the camera cannot be reached, the watcher refuses. About 10–20 checks a day, so no model training is
+needed.
+
+- **Camera:** a Tapo C100 (1080p, amazon.com/dp/B0866S3D82), replacing the Kasa camera below. It
+  serves RTSP locally once a "camera account" is created in the Tapo app (Advanced settings);
+  `rtsp://<user>:<pass>@<ip>:554/stream1` (main) or `/stream2` (sub), and
+  `ffmpeg -rtsp_transport tcp -i <url> -frames:v 1 still.jpg` grabs one frame. Turn its firmware
+  auto-update off once it works, because a firmware update is what closed the Kasa camera's stream.
+- **Where the grab runs is open.** The watcher runs on Fly and the camera is on the home LAN, so Fly
+  cannot reach it directly. Either something on the LAN (the Pi) grabs the still and serves it to the
+  watcher, or the camera's RTSP is reached over a tunnel. Decide when building.
+- **To start building:** the camera's LAN address and the camera-account username and password, which
+  Jared supplies once it is set up.
+
+Still open and separate from the camera: the cat-held stuck alert body is values only, pending
+Jared's wording (`TODO(copy)` in `litter_watcher.py`), and an untested idea is whether a powerOff/
+powerOn clears `isCatDetectPending` without moving the globe — try it only with the flag up, the box
+empty and someone watching.
+
 ## The Kasa camera on the box cannot be read locally
 
 A Kasa camera faces the robot, at <camera-ip> (TP-Link MAC <camera-mac>, DHCP). It looks like the
@@ -126,8 +155,7 @@ is refused with a handshake failure by both OpenSSL and GnuTLS (ffmpeg), and a P
 public client, there is no RTSP (554) or ONVIF, and the legacy 9999 query gets no answer. Other owners
 see the same on EC71 firmware 2.4.x (go2rtc issue #2521), likely from TP-Link's CVE-2026-9770 fix.
 No project has published the PSK derivation or a Kasa cloud snapshot API; python-kasa PR #1592 (TPAP)
-is the nearest lead and untested on cameras. A camera gate needs a camera with a documented local
-stream, such as a Tapo with RTSP enabled.
+is the nearest lead and untested on cameras. The camera gate above uses a Tapo with RTSP instead.
 
 ## Config
 
