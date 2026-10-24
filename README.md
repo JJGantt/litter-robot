@@ -115,6 +115,17 @@ Whisker's [light codes guide](https://www.litter-robot.com/support/article/litte
   is carried in the snapshot and logged on change, so what the panel was showing is
   recoverable after the fact.
 
+## The Kasa camera on the box cannot be read locally
+
+A Kasa camera faces the robot, at <camera-ip> (TP-Link MAC <camera-mac>, DHCP). It looks like the
+camera gate a stall or clean could check, and the stream path every guide gives —
+`https://<ip>:19443/https/stream/mixed`, Kasa email plus base64 password, the go2rtc `kasa://` source —
+does not work on its firmware. Port 19443 (and 18443) accepts only TLS-PSK: every certificate cipher
+is refused with a handshake failure by both OpenSSL and GnuTLS (ffmpeg), and a PSK offer gets
+"unknown psk identity". 10443 speaks TP-Link's TPAP (`tpap request lack paramters`). Neither has a
+public client, there is no RTSP (554) or ONVIF, and the legacy 9999 query gets no answer. A camera
+gate needs a camera with a documented local stream, or the Kasa cloud.
+
 ## Config
 
 Environment variables (see `.env-litter`, not committed). The safety-critical ones are documented in
