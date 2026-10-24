@@ -123,8 +123,11 @@ camera gate a stall or clean could check, and the stream path every guide gives 
 does not work on its firmware. Port 19443 (and 18443) accepts only TLS-PSK: every certificate cipher
 is refused with a handshake failure by both OpenSSL and GnuTLS (ffmpeg), and a PSK offer gets
 "unknown psk identity". 10443 speaks TP-Link's TPAP (`tpap request lack paramters`). Neither has a
-public client, there is no RTSP (554) or ONVIF, and the legacy 9999 query gets no answer. A camera
-gate needs a camera with a documented local stream, or the Kasa cloud.
+public client, there is no RTSP (554) or ONVIF, and the legacy 9999 query gets no answer. Other owners
+see the same on EC71 firmware 2.4.x (go2rtc issue #2521), likely from TP-Link's CVE-2026-9770 fix.
+No project has published the PSK derivation or a Kasa cloud snapshot API; python-kasa PR #1592 (TPAP)
+is the nearest lead and untested on cameras. A camera gate needs a camera with a documented local
+stream, such as a Tapo with RTSP enabled.
 
 ## Config
 
