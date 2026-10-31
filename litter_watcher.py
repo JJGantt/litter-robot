@@ -54,6 +54,8 @@ import httpx
 from dotenv import load_dotenv
 from pylitterbot import Account
 
+import ops_report as ops
+
 BASE = Path(__file__).parent
 load_dotenv(BASE / ".env-litter")
 
@@ -205,6 +207,10 @@ def log_event(event: str, **fields) -> None:
     except OSError:
         pass  # ephemeral fs (e.g. no volume mounted) -> stdout still has it
     _persist_event(rec)  # durable, best-effort mirror to Supabase litter_events
+    # Every failure here is an `*_error` event, so this one line is what puts them in front of the ops
+    # responder (health/responder), where a new incident starts an agent.
+    if event.endswith("_error"):
+        ops.report(f"{event}: {fields.get('error', '')}", context=fields)
 
 
 # The on-disk log above is wiped on every Fly redeploy, so meaningful events are also mirrored to
@@ -251,8 +257,9 @@ async def _persist_event_async(rec: dict) -> None:
             if r.status_code >= 300:   # raw print, NOT log_event, so a failure can't recurse
                 print(json.dumps({"ts": now_iso(), "event": "litter_events_error",
                                   "code": r.status_code, "detail": r.text[:160]}), flush=True)
-    except Exception:
-        pass  # durable log is best-effort; never disrupt the watcher
+                ops.report(f"litter_events_error: {r.status_code} {r.text[:160]}")
+    except Exception as ex:   # the mirror is best-effort and never disrupts the watcher, but it is reported
+        ops.report(f"litter_events_error: {ex}")
 
 
 def snapshot(robot) -> dict:
@@ -1034,14 +1041,17 @@ async def run_once(watcher: "Watcher") -> None:
             await asyncio.sleep(interval)
             await asyncio.wait_for(robot.refresh(), REFRESH_TIMEOUT)
             await watcher.evaluate()
+            # From the loop that does the work, so a refresh that hangs stops the beat (health/responder).
+            ops.beat(60)
     finally:
         try:
             await account.disconnect()
-        except Exception:
-            pass
+        except Exception as ex:
+            log_event("disconnect_error", error=str(ex))
 
 
 async def main() -> None:
+    ops.install(machine="fly", service="litter-robot-watcher")
     watcher = Watcher(None)   # created once so its trigger state (dirty/last_present/…) survives reconnects
     while True:
         try:

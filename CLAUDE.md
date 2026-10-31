@@ -55,7 +55,7 @@ expects it to show an animal; `test_visit.py` states what the visit trigger may 
 ## Pushing deploys — and a restart costs state
 
 `.github/workflows/deploy-watcher.yml` ships on any push to `main` that touches `litter_watcher.py`,
-`requirements.txt`, `Dockerfile`, `fly.toml`, or the workflow. The Fly deploy token lives in the
+`ops_report.py`, `requirements.txt`, `Dockerfile`, `fly.toml`, or the workflow. The Fly deploy token lives in the
 repo's `FLY_API_TOKEN` secret, so no machine needs `flyctl` for a normal deploy.
 
 Doc-only pushes deliberately do **not** deploy. The watcher's episode state — a pending clean, a

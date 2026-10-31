@@ -98,6 +98,10 @@ Whisker's [light codes guide](https://www.litter-robot.com/support/article/litte
 - **Failsafes.** Alerts to the phone (APNs via the status hub) if the robot
   goes unreachable, drops out of sleep mode, fills its drawer, or gets a scale it cannot
   zero. A healthchecks.io ping, fed once per connection cycle, catches a dead watcher.
+- **Reports to the ops responder** (health/responder). Every `*_error` event, and every failed write
+  to `litter_events`, is reported there, and the polling loop beats once per pass, so a hung
+  `refresh()` goes quiet like a dead watcher. `ops_report.py` is a copy of health/responder's
+  reporter (edit it there); it needs the `OPS_TOKEN` Fly secret.
 - **Survives a half-open socket.** A stale `refresh()` that returns old data with no error
   once left the watcher silently blind for a day, so the whole Whisker connection is recycled
   every `RECONNECT_EVERY_S` and every call has a timeout.
