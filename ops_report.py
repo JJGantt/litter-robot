@@ -12,6 +12,7 @@ OPS_URLS fall back to ~/.config/ops/env, which the Mac and the Pi both have.
 
 Sending happens on one background thread, so a caller never waits on the network.
 """
+import atexit
 import json
 import logging
 import os
@@ -93,15 +94,26 @@ def _flush_spool():
 def _sender():
     while True:
         kind, item = _q.get()
-        if _post(kind, [item]):
-            _flush_spool()
-        elif kind == "error":
-            # A missed beat is not kept: the next one replaces it, and its absence is the signal.
-            try:
-                with open(_spool_path(), "a") as f:
-                    f.write(json.dumps(item) + "\n")
-            except OSError:
-                pass
+        try:
+            if _post(kind, [item]):
+                _flush_spool()
+            elif kind == "error":
+                # A missed beat is not kept: the next one replaces it, and its absence is the signal.
+                try:
+                    with open(_spool_path(), "a") as f:
+                        f.write(json.dumps(item) + "\n")
+                except OSError:
+                    pass
+        finally:
+            _q.task_done()
+
+
+def flush(timeout=5.0):
+    """Wait for what is queued to be sent (or spooled). Runs at exit on its own, because a short-lived
+    script would otherwise end before the background thread had sent anything."""
+    end = time.time() + timeout
+    while _q.unfinished_tasks and time.time() < end:
+        time.sleep(0.05)
 
 
 def _ensure_thread():
@@ -181,3 +193,4 @@ def install(machine=None, service=None, spool=None):
     threading.excepthook = thook
     _ensure_thread()
     threading.Thread(target=_flush_spool, daemon=True).start()
+    atexit.register(flush)
