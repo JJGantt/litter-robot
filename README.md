@@ -150,7 +150,7 @@ empty and someone watching.
 
 ## The Kasa camera on the box cannot be read locally
 
-A Kasa camera faces the robot, at <camera-ip> (TP-Link MAC <camera-mac>, DHCP). It looks like the
+A Kasa camera on the home LAN faces the robot. It looks like the
 camera gate a stall or clean could check, and the stream path every guide gives —
 `https://<ip>:19443/https/stream/mixed`, Kasa email plus base64 password, the go2rtc `kasa://` source —
 does not work on its firmware. Port 19443 (and 18443) accepts only TLS-PSK: every certificate cipher
