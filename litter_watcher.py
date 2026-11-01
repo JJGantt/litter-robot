@@ -216,7 +216,7 @@ def log_event(event: str, **fields) -> None:
 # The on-disk log above is wiped on every Fly redeploy, so meaningful events are also mirrored to
 # Supabase (litter_events). These are too noisy / not about the robot to keep: closet-light control and
 # the 10-min reconnect churn (startup / scene reload / reconnect_cycle). Everything else persists.
-SKIP_PERSIST = {"light", "light_takeover", "light_restored", "diy_scenes_loaded",
+SKIP_PERSIST = {"light", "light_takeover", "light_restored", "diy_scenes_loaded", "diy_scenes_stale",
                 "reconnect_cycle", "startup"}
 _CORE_KEYS = {"ts", "event", "status", "cycleState", "cycleStatus", "weight", "catWeight",
               "catDetect", "drawerPct", "litterPct", "is_sleeping", "online"}
@@ -368,14 +368,26 @@ async def load_diy_scenes() -> None:
                 headers={"Govee-API-Key": GOVEE_API_KEY, "Content-Type": "application/json"},
                 json=payload,
             )
-        _DIY_SCENES.clear()
+        resp.raise_for_status()
+        scenes = {}
         for c in resp.json().get("payload", {}).get("capabilities", []):
             if c.get("instance") == "diyScene":
                 for o in c.get("parameters", {}).get("options", []):
-                    _DIY_SCENES[o["name"]] = o["value"]
-        log_event("diy_scenes_loaded", scenes=_DIY_SCENES)
+                    scenes[o["name"]] = o["value"]
+        if not scenes:
+            raise ValueError(f"no DIY scenes in response: {resp.text[:200]}")
     except Exception as ex:
-        log_event("diy_scenes_error", error=str(ex))
+        # repr, not str: an httpx timeout stringifies to "".
+        if _DIY_SCENES:
+            # This runs on every 10-min reconnect and the last good mapping is kept, so one slow
+            # Govee call changes nothing. A light that really cannot be driven reports light_error.
+            log_event("diy_scenes_stale", error=repr(ex))
+        else:
+            log_event("diy_scenes_error", error=repr(ex))
+        return
+    _DIY_SCENES.clear()
+    _DIY_SCENES.update(scenes)
+    log_event("diy_scenes_loaded", scenes=_DIY_SCENES)
 
 
 async def set_closet_light(scene: str) -> None:
