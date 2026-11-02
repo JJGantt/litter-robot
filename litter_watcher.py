@@ -807,7 +807,7 @@ class Watcher:
             # (Whisker replaces it under WhiskerCare for exactly this symptom).
             self.scale_alerted = True
             await notify("🚨 Litter-Robot scale stuck",
-                         f"The scale has read {round(w, 1)} lb on an empty, idle box for "
+                         f"The scale has read {round(w, 1)} lb on an idle box for "
                          f"{int(held // 60)}+ min and {self.scale_presses} reset presses have not zeroed "
                          f"it. Check the feet/mat and the litter level; if it keeps happening the base "
                          f"scale is failing.",
@@ -885,7 +885,7 @@ class Watcher:
             self.lockout_alerted = True
             await notify("🚨 Litter-Robot stuck in lockout",
                          f"The box has shown its 30-minute cat-detect lockout for {int(held // 60)}+ min "
-                         f"over an empty scale, and {self.lockout_presses} reset presses have not cleared "
+                         f"and {self.lockout_presses} reset presses have not cleared "
                          f"it. It is not cycling until someone touches it.",
                          "litter_lockout")
 
