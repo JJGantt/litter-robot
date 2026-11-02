@@ -1062,8 +1062,28 @@ async def run_once(watcher: "Watcher") -> None:
             log_event("disconnect_error", error=str(ex))
 
 
+# The gates that keep a cat from being spun can be made stricter from the environment, never looser
+# (CLAUDE.md). The floor is each gate's default; a value past it stops the watcher at startup rather
+# than letting it press sooner than the robot's own "this cannot be a cat".
+GATE_FLOORS = (("SCALE_STUCK_SECONDS", 1800, "min"), ("STALL_CONFIRM_SECONDS", 60, "min"),
+               ("SCALE_STATIC_TOL", 0.25, "max"))
+
+
+def loosened_gates() -> list:
+    bad = []
+    for name, floor, kind in GATE_FLOORS:
+        v = globals()[name]
+        if (kind == "min" and v < floor) or (kind == "max" and v > floor):
+            bad.append(f"{name}={v} (must be {'>=' if kind == 'min' else '<='} {floor})")
+    return bad
+
+
 async def main() -> None:
     ops.install(machine="fly", service="litter-robot-watcher")
+    bad = loosened_gates()
+    if bad:
+        log_event("gate_config_error", refused=bad)
+        raise SystemExit(1)
     watcher = Watcher(None)   # created once so its trigger state (dirty/last_present/…) survives reconnects
     while True:
         try:

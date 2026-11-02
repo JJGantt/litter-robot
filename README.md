@@ -164,7 +164,8 @@ is the nearest lead and untested on cameras. The camera gate above uses a Tapo w
 ## Config
 
 Environment variables (see `.env-litter`, not committed). The safety-critical ones are documented in
-[CLAUDE.md](CLAUDE.md) — do not retune those to make something convenient.
+[CLAUDE.md](CLAUDE.md); `SCALE_STUCK_SECONDS`, `STALL_CONFIRM_SECONDS` and `SCALE_STATIC_TOL` can be set
+stricter than their defaults but not looser (the watcher refuses to start).
 
 | Var | Default | Meaning |
 |-----|---------|---------|
@@ -201,8 +202,7 @@ python litter_watcher.py
 
 Runs as an always-on worker (no public ports). Credentials live in Fly secrets.
 
-**Shipping is CI's job.** Pushing a change to `litter_watcher.py`, `requirements.txt`, `Dockerfile`
-or `fly.toml` on `main` runs `.github/workflows/deploy-watcher.yml`, which deploys to Fly and then
+**Shipping is CI's job.** Pushing anything but docs (`*.md`) or tests (`test_*.py`) to `main` runs `.github/workflows/deploy-watcher.yml`, which deploys to Fly and then
 checks the log for a `startup` line — a green deploy only proves Fly accepted the release, not that
 the watcher reconnected to the Whisker API. Trigger it by hand with:
 

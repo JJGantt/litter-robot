@@ -106,6 +106,12 @@ async def main() -> int:
     presses, _ = await run(steady(snap(status="READY"), 0, 4000))
     check("a box that is not stalled is never pressed", presses, 0)
 
+    check("the default gates start", lw.loosened_gates(), [])
+    saved = lw.STALL_CONFIRM_SECONDS
+    lw.STALL_CONFIRM_SECONDS = 30
+    check("a shortened stall confirm refuses to start", len(lw.loosened_gates()), 1)
+    lw.STALL_CONFIRM_SECONDS = saved
+
     print("all passed" if not failed else f"{len(failed)} failed")
     return 1 if failed else 0
 

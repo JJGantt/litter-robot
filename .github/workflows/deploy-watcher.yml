@@ -9,15 +9,12 @@ name: Deploy watcher
 on:
   push:
     branches: [main]
-    # Only when something that actually ships changed — a README edit should not restart the watcher
-    # and lose the in-memory episode state (a pending clean, a stall it is mid-way through rescuing).
-    paths:
-      - 'litter_watcher.py'
-      - 'ops_report.py'
-      - 'requirements.txt'
-      - 'Dockerfile'
-      - 'fly.toml'
-      - '.github/workflows/deploy-watcher.yml'
+    # Not for docs or tests: those do not ship, and a restart loses the in-memory episode state (a
+    # pending clean, a stall it is mid-way through rescuing). Everything else deploys, so a new module
+    # cannot ship stale for want of being added to a list here.
+    paths-ignore:
+      - '**.md'
+      - 'test_*.py'
   workflow_dispatch: {}      # and by hand, for a redeploy with no code change
 
 concurrency:

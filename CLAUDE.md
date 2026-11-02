@@ -17,6 +17,11 @@ that whole window (`SCALE_STATIC_TOL`). Each gate is load-bearing:
 A cat spun in the globe is the one outcome this repo exists to prevent. Do not shorten the window,
 widen the tolerance, or skip a gate to make a test easier.
 
+The environment can only tighten them: `GATE_FLOORS` stops the watcher at startup (a
+`gate_config_error`, reported) when `SCALE_STUCK_SECONDS`, `STALL_CONFIRM_SECONDS` or
+`SCALE_STATIC_TOL` is set looser than its default. Changing a floor in the code is the same decision
+as loosening the gate.
+
 `check_lockout` presses on a second, narrower case — the robot's own `DC_CAT_DETECT_30M` lockout,
 still showing over a scale that reads zero — and it reaches that by *adding* gates, never by dropping
 one of the above. The firmware has already served the 30 minutes; a zero reading means there is
@@ -54,8 +59,8 @@ expects it to show an animal; `test_visit.py` states what the visit trigger may 
 
 ## Pushing deploys — and a restart costs state
 
-`.github/workflows/deploy-watcher.yml` ships on any push to `main` that touches `litter_watcher.py`,
-`ops_report.py`, `requirements.txt`, `Dockerfile`, `fly.toml`, or the workflow. The Fly deploy token lives in the
+`.github/workflows/deploy-watcher.yml` ships on any push to `main` except one touching only docs
+(`*.md`) or tests (`test_*.py`). The Fly deploy token lives in the
 repo's `FLY_API_TOKEN` secret, so no machine needs `flyctl` for a normal deploy.
 
 Doc-only pushes deliberately do **not** deploy. The watcher's episode state — a pending clean, a
