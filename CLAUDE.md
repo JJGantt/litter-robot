@@ -22,12 +22,18 @@ The environment can only tighten them: `GATE_FLOORS` stops the watcher at startu
 `SCALE_STATIC_TOL` is set looser than its default. Changing a floor in the code is the same decision
 as loosening the gate.
 
-`check_lockout` presses on a second, narrower case — the robot's own `DC_CAT_DETECT_30M` lockout,
-still showing over a scale that reads zero — and it reaches that by *adding* gates, never by dropping
-one of the above. The firmware has already served the 30 minutes; a zero reading means there is
-nothing on the scale to spin; a non-zero reading is handed back to the auto-tare, which is the path
-that alerts rather than presses when the weight wanders. The suffix is the whole safety margin:
-`DC_CAT_DETECT` without it is a live cat standing on the scale.
+In practice the auto-tare has never fired: the cloud weight has never read non-zero (below), so its
+gates stand for a reading the cloud does not publish.
+
+`check_lockout` presses on the robot's own `DC_CAT_DETECT_30M` lockout on an idle box. Its safety
+does **not** come from the scale: a zero reading is what the cloud shows with a cat on it, and the
+lockout means the robot sensed something for 30 minutes. It comes from what a short reset does to a
+parked globe — every one of the 42 logged `lockout_reset` presses was answered by `DCX_CONFIRM` /
+`DC_MODE_IDLE` with the status still `READY`/`DRAWER_FULL` and no cycle started, including two that
+landed with `isCatDetectPending` up and left it up (the robot clears that flag as any cycle starts).
+So keep the idle-status gate and the confirm dwell, and never widen it to another display code:
+`DC_CAT_DETECT` without the suffix is a live cat standing on the scale. Its `abs(w) <= SCALE_ZERO_TOL`
+condition only routes a non-zero reading, should the cloud ever publish one, to the auto-tare.
 
 `test_lockout.py` writes each of those gates down as a case and the deploy workflow runs it, so a
 gate removed in `check_lockout` fails the build rather than the animal. Run it directly —
@@ -53,9 +59,11 @@ breaks the model this code is built on, and the watcher will alert about it.
 ## The cloud never carries the live scale
 
 `weightSensor` in Whisker's state document reads 0.0 with a cat, or 10 lb of iron, on the scale,
-asleep or awake (measured 2026-08-29). It is only ever non-zero as a reading stuck after a cycle,
-which is all the tare and lockout paths use it for. Do not add a trigger, a gate, or a test that
-expects it to show an animal; `test_visit.py` states what the visit trigger may rely on instead.
+asleep or awake (measured 2026-08-29). It has never been seen non-zero at all: every snapshot in
+`litter_events` (4,967 from 2026-08-16 to 2026-11-02, 1,262 of them under `DC_CAT_DETECT`) reads
+exactly 0. A zero reading is therefore not evidence of an empty box, anywhere in this code. Do not add
+a trigger, a gate, or a test that expects it to show an animal, or that treats zero as "nothing
+inside"; `test_visit.py` states what the visit trigger may rely on instead.
 
 ## Pushing deploys — and a restart costs state
 

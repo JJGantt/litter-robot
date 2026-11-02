@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Litter-Robot 4 auto-resume watcher.
 
-The LR4 intermittently throws a false CAT_SENSOR_INTERRUPTED mid-cycle (weight
-sensor ~0, no cat present). This watcher detects it and presses the reset button
-(shortResetPress) to resume the cycle.
+The LR4 intermittently throws a false CAT_SENSOR_INTERRUPTED mid-cycle. This watcher
+detects it and presses the reset button (shortResetPress) to resume the cycle.
 
 Detection — adaptive polling (the device does NOT push state, confirmed by test):
 poll slowly while idle; the instant a poll sees a cycle running or stuck, ramp to
@@ -12,19 +11,20 @@ ends. A safety cap stops fast-polling if a "cycle" somehow never completes.
 
 Action: reset ONLY a cycle that started but stalled mid-way (CAT_SENSOR_INTERRUPTED /
 PAUSED) — never on a mere CAT_DETECTED (there the globe never moved; resetting would just
-spin the box on the cat that was sensed). The stall must hold a continuously empty scale for
-a confirm dwell before the first press, so a normal (transient) cat visit is never touched —
-only a genuine stall persists that long. Then retry on a spaced cadence (past the robot's
-~10-15s response lag, so we never re-press mid-landing) until it clears.
+spin the box on the cat that was sensed). The stall must hold for a confirm dwell with the robot's
+isCatDetectPending flag never rising — the only cat signal the cloud carries, since its weight
+reads 0 with a cat on the scale. Then retry on a spaced cadence (past the robot's ~10-15s response
+lag, so we never re-press mid-landing) until it clears.
 
 Phantom weight: the opposite failure. The scale drifts off zero on an IDLE box, the robot decides a
 cat is standing in it, and after 30 minutes it locks out with a blue bar + partial yellow flashing and
-stops cycling. We tare it with the same reset press, gated on the reading being static (a cat's is not).
+stops cycling. We would tare it with the same reset press, gated on a static non-zero reading, but
+the cloud has never published a non-zero weight, so this path has never fired.
 
-Lockout: that same 30-minute cat-detect, still showing after the weight behind it has fallen back to
-zero. The tare never begins (it waits on a non-zero reading) and the stall watcher wants a mid-cycle
-status, so the box sits dead with nothing looking at it. We press reset once the robot's own verdict
-has held over an empty scale.
+Lockout: that 30-minute cat-detect (DC_CAT_DETECT_30M) on an idle box. The tare never begins and the
+stall watcher wants a mid-cycle status, so the box sits dead with nothing looking at it. We press
+reset once the code has held across a confirm dwell; on a parked globe the press clears the latch
+and has never started a cycle (see check_lockout).
 
 Failsafe: phone push (APNs via the status hub) if the robot is unreachable; a healthchecks.io
 heartbeat so an external monitor catches a dead watcher. Reconnects on any failure.
@@ -38,7 +38,7 @@ Config (env, with defaults):
   MAX_FAST_SECONDS           - safety cap: stop fast-polling after this long (default 600)
   WEIGHT_THRESHOLD_LB        - max weight treated as "no cat" (default 3.0)
   SCALE_STUCK_SECONDS        - non-zero scale on an idle box this long -> auto-tare (default 1800)
-  LOCKOUT_CONFIRM_SECONDS    - 30-min cat-detect held over an empty scale this long -> reset (default 120)
+  LOCKOUT_CONFIRM_SECONDS    - 30-min cat-detect held on an idle box this long -> reset (default 120)
   LOG_DIR                    - log directory (default ./logs)
 """
 
@@ -81,26 +81,30 @@ STUCK_REALERT_SECONDS = float(os.environ.get("STUCK_REALERT_SECONDS", 1800)) # r
 # in it forever. Its firmware gives up after 30 minutes and shows a BLUE light bar with PARTIAL YELLOW
 # FLASHING, and while that is showing THE BOX WILL NOT CYCLE. Whisker's own fix is a short reset press,
 # which re-zeroes the scale — exactly the button we can already press.
-# The stall watcher above can never catch this: it fires on a mid-cycle stall with an EMPTY scale, and
-# this is an idle box with a NON-empty one, so it was a blind spot by construction.
-# Gates before we press, so a real cat is never spun:
+# The stall watcher above can never catch this: it fires on a mid-cycle stall, and this is an idle box.
+# What the watcher can SEE of it is the cloud's weightSensor, and that has never once read non-zero:
+# every snapshot in litter_events (4,967, 2026-08-16 to 2026-11-02) reads exactly 0, including 1,262
+# taken while the light bar showed DC_CAT_DETECT for a cat on the scale. So this detector has never
+# begun an episode, and the robot's lockout is caught by check_lockout below instead. Its gates are
+# what applies if the cloud ever does carry a non-zero reading:
 #   * the box must be idle (no cycle running, not stuck — those are the reset path's job);
 #   * the scale must read non-zero continuously for SCALE_STUCK_SECONDS. The default is the robot's own
-#     30 minutes, so we are never more aggressive than the manufacturer's "this cannot be a cat";
-#   * the reading must be essentially STATIC across that window. A live animal's weight wanders as it
-#     shifts; a drifted zero is dead flat. If it wanders we do not press — we alert instead.
+#     30 minutes, so we never act before the robot's own lockout would;
+#   * the reading must be essentially STATIC across that window, on the expectation that an animal
+#     shifts its weight and a drifted zero does not (unmeasured: no non-zero reading has ever been
+#     seen). If it wanders we do not press — we alert instead.
 SCALE_ZERO_TOL = float(os.environ.get("SCALE_ZERO_TOL", 0.2))            # |lb| below this = a zeroed scale
 SCALE_STUCK_SECONDS = float(os.environ.get("SCALE_STUCK_SECONDS", 1800)) # non-zero this long on an idle box = phantom
 SCALE_STATIC_TOL = float(os.environ.get("SCALE_STATIC_TOL", 0.25))       # max peak-to-peak lb across that window
 SCALE_RETRY_SECONDS = float(os.environ.get("SCALE_RETRY_SECONDS", 120))  # min gap between tare presses
 SCALE_ALERT_AFTER = int(os.environ.get("SCALE_ALERT_AFTER", 3))          # presses that fail to clear it -> call a human
 
-# ---- Firmware lockout latched over a scale that reads zero -----------------------------------------
+# ---- Firmware 30-minute cat-detect lockout --------------------------------------------------------
 # The third failure, and the one nothing else can reach. The robot trips its own 30-minute cat-detect
-# lockout and stops cycling — but the weight it latched on then falls back to zero. check_scale starts
-# its dwell on a NON-ZERO reading, so it sees a clean, idle box and never begins; the stall watcher
-# needs a mid-cycle status and this one is READY. The box is simply dead until a human presses reset.
-# Observed 2026-08-27: 80 minutes locked out with weight 0.0, no detector even looking at it.
+# lockout and stops cycling. check_scale never starts on it, because the cloud weight reads 0 here as it
+# does everywhere (see above); the stall watcher needs a mid-cycle status and this one is READY. The box
+# is simply dead until a human presses reset. Observed 2026-08-27: 80 minutes locked out, no detector
+# looking at it. A zero weight here says nothing about whether the globe is empty.
 # DC_CAT_DETECT_30M is the lockout specifically. DC_CAT_DETECT (no suffix) is an ordinary cat on the
 # scale and must never be acted on — that is a live animal, and the two differ only by that suffix.
 LOCKOUT_DISPLAY_CODES = {"DC_CAT_DETECT_30M"}
@@ -669,7 +673,9 @@ class Watcher:
              only live cat signal the cloud carries while asleep (see CLAUDE.md); the weight gate
              below cannot see an animal. A cat that walks in on a cycle is this case, and a 30s
              press without this gate restarted the globe on one (2026-10-23 13:40Z).
-          2. Empty scale — kept, but it only ever sees a stuck reading, never a cat.
+          2. Empty scale — kept as a hand-off in case the cloud ever carries a reading, but the
+             cloud weight has read 0 in every logged snapshot, cat or no cat, so it has never held
+             a press and is not evidence of anything.
           3. Persistence — the stall must hold for STALL_CONFIRM_SECONDS before the FIRST press.
              The robot raises the pending flag some seconds after it halts (16s on 2026-10-23), so
              this dwell is also what gives gate 1 time to see it.
@@ -741,8 +747,11 @@ class Watcher:
 
         Only ever runs on an IDLE box: a cycle in flight, a stall, a cat-detect status and an offline
         robot all belong to other paths, and a moving globe makes the reading meaningless anyway.
-        Presses only once the reading has been non-zero AND essentially static for SCALE_STUCK_SECONDS
-        — a cat shifts its weight, a drifted zero does not — so a real animal is never spun.
+        Presses only once the reading has been non-zero AND essentially static for SCALE_STUCK_SECONDS.
+
+        It has never fired: the cloud's weightSensor has read 0 in every logged snapshot, including
+        with a cat on the scale (see the PHANTOM WEIGHT block above), so no episode has ever begun.
+        The gates stand for a reading the cloud does not currently publish.
         """
         status = snap["status"]
         w = snap.get("weight")
@@ -812,19 +821,33 @@ class Watcher:
         self.lockout_flagged = False
 
     async def check_lockout(self, snap: dict, now: float) -> None:
-        """Clear a 30-minute cat-detect lockout that is latched over an EMPTY scale.
+        """Clear the robot's own 30-minute cat-detect lockout (DC_CAT_DETECT_30M) on an idle box.
 
         While it shows, the box will not cycle at all, and no other path here can end it: check_scale
-        begins its dwell on a non-zero reading and this reading has already fallen back to zero, and the
-        stall watcher wants a mid-cycle status where this one is READY. So the box stays dead until a
-        human presses the button — 80 minutes of it on 2026-08-27, with every detector looking elsewhere.
+        never starts (the cloud weight reads 0), and the stall watcher wants a mid-cycle status where
+        this one is READY. So the box stays dead until a human presses the button — 80 minutes of it on
+        2026-08-27, with every detector looking elsewhere.
 
-        This does not weaken the auto-tare's gates; it presses on a strictly narrower case. Required:
-        an idle box (a parked globe — the same state check_scale tares in, where a reset zeroes the
-        scale rather than moving anything), the robot's OWN verdict that 30 minutes of continuous
-        detection cannot be an animal, and a scale reading zero, so there is nothing on it to spin. A
-        non-zero reading is check_scale's episode and this one declines it — which is what keeps a
-        settled cat, whose weight wanders, on the path that alerts instead of pressing.
+        Nothing here knows the globe is empty. The cloud weight reads 0 with a cat on the scale, so a
+        zero reading is not evidence of anything, and the lockout itself means the robot sensed
+        something for 30 minutes — on 2026-11-02 it raised isCatDetectPending (a visit) while locked
+        out and four presses did not clear it. What the press relies on instead:
+          * the robot's own lockout code, held across LOCKOUT_CONFIRM_SECONDS of polls (the API serves
+            stale snapshots), and never plain DC_CAT_DETECT, which is a cat on the scale right now;
+          * an idle status (SCALE_IDLE_STATES): the globe is parked, not mid-cycle;
+          * what a short reset press does in that state: it clears the latch (sometimes only after
+            several presses) and has never started a cycle. Every lockout_reset logged (42, 2026-08-27 to 2026-11-02) was followed by
+            DCX_CONFIRM / DC_MODE_IDLE within 5-83s with the status still READY or DRAWER_FULL, and
+            no cycle began from a press; a cycle lasts minutes, so the 20s idle poll cannot miss one.
+            On 2026-11-02 two presses landed with isCatDetectPending up and it stayed up, which it
+            would not have if a cycle had started (the robot clears it as any cycle starts).
+        Clearing the latch does make the box able to cycle again, so a clean owed by maybe_clean can
+        follow it; that cycle is gated there, not here.
+
+        The weight condition is a hand-off, not a safety signal: if the cloud ever does publish a
+        non-zero reading on an idle box, that reading goes to check_scale, whose static-reading gate
+        alerts instead of pressing when it wanders. It has never declined a lockout — every one logged
+        read 0.
         """
         w = snap.get("weight")
         locked = (snap.get("displayCode") in LOCKOUT_DISPLAY_CODES
@@ -853,7 +876,7 @@ class Watcher:
         self.lockout_presses += 1
         log_event("lockout_reset", attempt=self.lockout_presses, held_min=round(held / 60), **snap)
         try:
-            await self.robot.reset()   # short reset press = clear the latch and re-zero the scale
+            await self.robot.reset()   # short reset on a parked globe: clears the latch; no press has started a cycle
         except Exception as ex:
             log_event("lockout_reset_error", error=str(ex))
 

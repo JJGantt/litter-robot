@@ -67,10 +67,10 @@ async def main() -> int:
             print(f"FAIL  {name}: got {got!r}, want {want!r}")
             failed.append(name)
 
-    # The failure this exists for: 2026-08-27, 80 minutes locked out over a scale reading 0.0,
-    # with check_scale waiting on a non-zero reading that never came.
+    # The failure this exists for: 2026-08-27, 80 minutes locked out on an idle box. The cloud weight
+    # reads 0.0 here as it does everywhere, cat or no cat, so check_scale never starts on it.
     presses, w = await run(steady(snap(), 0, 400))
-    check("presses on a lockout held over an empty scale", presses, 1)
+    check("presses on a confirmed lockout on an idle box", presses, 1)
     check("and flags the closet light while it holds", w.lockout_flagged, True)
 
     # Presses are spaced by LOCKOUT_RETRY_SECONDS, not issued once per poll.
@@ -81,11 +81,13 @@ async def main() -> int:
     presses, _ = await run(steady(snap(code="DC_CAT_DETECT"), 0, 4000))
     check("an ordinary cat-detect is never pressed", presses, 0)
 
-    # A real reading is check_scale's episode — it is the path that alerts when the weight wanders.
+    # The cloud has never published a non-zero weight, but if it does, that reading is check_scale's
+    # episode — the path that alerts instead of pressing when the weight wanders.
     presses, _ = await run(steady(snap(weight=8.4), 0, 4000))
     check("a non-zero weight defers to check_scale", presses, 0)
 
-    # A parked globe is what makes a reset a tare. Mid-cycle belongs to the stall watcher.
+    # A parked globe is why a press here clears the latch without a cycle. Mid-cycle belongs to the
+    # stall watcher.
     presses, _ = await run(steady(snap(status="CAT_SENSOR_INTERRUPTED"), 0, 4000))
     check("a mid-cycle status is not ours to press", presses, 0)
 
@@ -93,9 +95,9 @@ async def main() -> int:
     presses, _ = await run(steady(snap(), 0, 100) + steady(snap(code="DC_MODE_IDLE"), 100, 4000))
     check("a lockout that clears inside the dwell is not pressed", presses, 0)
 
-    # A missing weight is not evidence of an empty scale.
+    # A snapshot with no weight field is an incomplete read; hold rather than press on it.
     presses, _ = await run(steady(snap(weight=None), 0, 4000))
-    check("a null weight is not an empty scale", presses, 0)
+    check("a null weight is not pressed", presses, 0)
 
     # Going offline ends the episode (evaluate calls _end_lockout_episode on that branch). The dwell
     # has to restart on the way back: carried across an outage it would already be satisfied, and the

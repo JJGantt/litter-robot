@@ -28,41 +28,35 @@ false trips keep their rescue.
 **2. A phantom weight on an idle box (loaded scale).** The scale drifts off zero — a nudge, a
 foot caught on the mat, litter added, the drawer emptied — and the robot then believes a cat
 is standing in it. `robotStatus` stays `ROBOT_IDLE`, so *nothing in `status` ever says
-anything is wrong*, and the first detector can't see it: it wants a stalled cycle with an
-empty scale, and this is a parked globe with a loaded one. After 30 minutes the robot gives up
-and locks itself out — **blue light bar with partial yellow flashing — and it stops cycling
-until someone presses Reset.** Whisker's own fix for that light code is a short reset press,
-which re-zeroes the scale, so the watcher does it.
+anything is wrong*. After 30 minutes the robot gives up and locks itself out — **blue light bar
+with partial yellow flashing — and it stops cycling until someone presses Reset.** Whisker's own
+fix for that light code is a short reset press, which re-zeroes the scale.
 
-The gates before it presses, so a real cat is never spun: the box must be idle (a running or
-stalled cycle belongs to detector 1), the scale must read non-zero *continuously* for
-`SCALE_STUCK_SECONDS` (default 1800 — the robot's own 30 minutes, so we are never more
-aggressive than the manufacturer's "this cannot be a cat"), and the reading must be
-essentially **static** across that window. A live animal's weight wanders as it shifts; a
-drifted zero is dead flat. If it wanders, the watcher does not press — it alerts instead, so
-a cat that has genuinely settled in for the afternoon is safe.
+Detector 2 is built to tare it: on an idle box whose cloud weight has read non-zero continuously for
+`SCALE_STUCK_SECONDS` (default 1800, the robot's own 30 minutes) and essentially **static** across
+that window, it presses; if the reading wanders, it alerts instead. **It has never fired.** The cloud
+weight (`weightSensor`) has read exactly 0 in every snapshot the watcher has logged — 4,967 from
+2026-08-16 to 2026-11-02, 1,262 of them while the light bar showed a cat on the scale — so no episode
+has ever begun, and in practice the lockout this failure ends in is caught by detector 3.
 
-If several tare presses fail to zero it, that is the symptom Whisker replaces the base unit
-for under WhiskerCare, and the alert says so.
-
-**3. A lockout still showing after the scale has come back to zero.** The same 30-minute
-lockout as failure 2, outliving the weight that caused it. Detector 2 cannot end this one: it
-starts its dwell on a *non-zero* reading, and the scale now reads 0.0, so it sees a clean idle
-box and never begins. Detector 1 wants a stalled mid-cycle status, and this one is `READY`. Without
-a third detector the box stays locked until a human notices the light bar.
+**3. The 30-minute lockout itself.** Whatever caused it, the robot shows `DC_CAT_DETECT_30M` and will
+not cycle. Detector 2 cannot see it (the weight reads 0), and detector 1 wants a stalled mid-cycle
+status where this one is `READY`. Without a third detector the box stays locked until a human
+notices the light bar.
 
 The watcher presses Reset once `DC_CAT_DETECT_30M` has held for `LOCKOUT_CONFIRM_SECONDS`
-(default 120) on an idle box whose scale reads zero. The suffix carries the whole meaning:
-`DC_CAT_DETECT_30M` is the lockout, while plain `DC_CAT_DETECT` is an ordinary cat standing on
-the scale and is never acted on.
+(default 120) on an idle box. The suffix carries the whole meaning: `DC_CAT_DETECT_30M` is the
+lockout, while plain `DC_CAT_DETECT` is an ordinary cat standing on the scale and is never acted on.
 
-This is a **narrower** case than detector 2, not a looser one. The robot's own firmware has
-already spent its 30 minutes deciding this cannot be an animal, and a scale reading zero means
-there is nothing on it to spin; the globe is parked, so the press is a tare and not a cycle. A
-non-zero reading is handed straight back to detector 2 — the path that alerts instead of
-pressing when the weight wanders, which is what keeps a cat that has settled in for the
-afternoon safe. `test_lockout.py` states each of those gates as a case, and the deploy workflow
-runs it before it ships; `test_stall.py` does the same for failure 1.
+The press is **not** made on evidence that the box is empty — nothing in the cloud gives that, and
+the lockout means the robot sensed something for 30 minutes (on 2026-11-02 it flagged a visit while
+locked out, and four presses did not clear it). What makes it safe is what a short reset does to a
+parked globe: it clears the latch and does not start a cycle. Every one of the 42 presses logged
+from 2026-08-27 to 2026-11-02 was followed within 5-83 s by `DCX_CONFIRM` / `DC_MODE_IDLE`, with the
+status still `READY` or `DRAWER_FULL` and no cycle begun; two landed with `isCatDetectPending` up and
+it stayed up, which it would not if a cycle had started. Clearing the latch does let a clean that is
+owed (see "Drives cleaning" below) run afterwards. `test_lockout.py` states the lockout gates as
+cases, and the deploy workflow runs it before it ships; `test_stall.py` does the same for failure 1.
 
 ## Litter-Robot 4 light codes worth knowing
 
