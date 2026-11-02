@@ -53,6 +53,8 @@ _recent = {}
 _q = queue.Queue()
 _lock = threading.Lock()
 _started = False
+# Set by install() when this process is not the service it names; see there.
+_off = False
 
 
 def _spool_path():
@@ -60,6 +62,8 @@ def _spool_path():
 
 
 def _post(kind, items):
+    if _off:
+        return True
     if not TOKEN:
         return False
     body = json.dumps(items).encode()
@@ -174,8 +178,14 @@ def _send_now(item):
 
 
 def install(machine=None, service=None, spool=None):
-    global MACHINE, SERVICE, SPOOL
+    global MACHINE, SERVICE, SPOOL, _off
     MACHINE, SERVICE, SPOOL = machine or MACHINE, service or SERVICE, spool or SPOOL
+    # 'fly' names the live service, and Fly sets FLY_APP_NAME on every machine. Without it this is the
+    # same code run somewhere else (a script on the Mac importing server.py), and it would file its
+    # failures, and its beats, as the live service's. So it sends nothing.
+    if MACHINE == "fly" and not os.environ.get("FLY_APP_NAME"):
+        _off = True
+        sys.stderr.write("[ops] %s names machine 'fly' but FLY_APP_NAME is unset: not reporting\n" % SERVICE)
     logging.getLogger().addHandler(_Handler(level=logging.ERROR))
     prev = sys.excepthook
 
