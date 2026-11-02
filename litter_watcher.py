@@ -297,7 +297,7 @@ async def push_app(title: str, body: str, kind: str = "litter") -> None:
         return
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.post(HUB_NOTIFY_URL, params={"token": HUB_NOTIFY_TOKEN},
+            r = await client.post(HUB_NOTIFY_URL, headers={"X-Hub-Token": HUB_NOTIFY_TOKEN},
                                   json={"kind": kind, "title": title, "body": body})
             if r.status_code != 200:
                 log_event("app_push_error", status=r.status_code, detail=r.text[:120])
