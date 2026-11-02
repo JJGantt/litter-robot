@@ -838,7 +838,8 @@ class Watcher:
           * what a short reset press does in that state: it clears the latch (sometimes only after
             several presses) and has never started a cycle. Every lockout_reset logged (42, 2026-08-27 to 2026-11-02) was followed by
             DCX_CONFIRM / DC_MODE_IDLE within 5-83s with the status still READY or DRAWER_FULL, and
-            no cycle began from a press; a cycle lasts minutes, so the 20s idle poll cannot miss one.
+            no cycle began from a press; a cycle lasts minutes, so the idle poll (SLOW_POLL, seconds)
+            cannot miss one.
             On 2026-11-02 two presses landed with isCatDetectPending up and it stayed up, which it
             would not have if a cycle had started (the robot clears it as any cycle starts).
         Clearing the latch does make the box able to cycle again, so a clean owed by maybe_clean can
