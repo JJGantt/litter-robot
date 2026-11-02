@@ -48,9 +48,8 @@ for under WhiskerCare, and the alert says so.
 **3. A lockout still showing after the scale has come back to zero.** The same 30-minute
 lockout as failure 2, outliving the weight that caused it. Detector 2 cannot end this one: it
 starts its dwell on a *non-zero* reading, and the scale now reads 0.0, so it sees a clean idle
-box and never begins. Detector 1 wants a stalled mid-cycle status, and this one is `READY`. The
-box sits dead with nothing looking at it — 80 minutes of it on 2026-08-27, and it would have
-stayed that way until a human noticed the light bar.
+box and never begins. Detector 1 wants a stalled mid-cycle status, and this one is `READY`. Without
+a third detector the box stays locked until a human notices the light bar.
 
 The watcher presses Reset once `DC_CAT_DETECT_30M` has held for `LOCKOUT_CONFIRM_SECONDS`
 (default 120) on an idle box whose scale reads zero. The suffix carries the whole meaning:
@@ -102,8 +101,7 @@ Whisker's [light codes guide](https://www.litter-robot.com/support/article/litte
   to `litter_events`, is reported there, and the polling loop beats once per pass, so a hung
   `refresh()` goes quiet like a dead watcher. `ops_report.py` is a copy of health/responder's
   reporter (edit it there); it needs the `OPS_TOKEN` Fly secret.
-- **Survives a half-open socket.** A stale `refresh()` that returns old data with no error
-  once left the watcher silently blind for a day, so the whole Whisker connection is recycled
+- **Survives a half-open socket.** `refresh()` can return stale data with no error, so the whole Whisker connection is recycled
   every `RECONNECT_EVERY_S` and every call has a timeout.
 - **Publishes status** to Supabase `device_status` for the hub's litter card, on any change and
   at least every `PUBLISH_SECONDS` (a timer alone left the card reading hours stale through a
@@ -123,11 +121,11 @@ Whisker's [light codes guide](https://www.litter-robot.com/support/article/litte
 
 The pending flag (failure 1) only covers a cat that arrives *during* a stall. It cannot see a second
 cat that walks in during the 15-minute dwell after a first one, because the flag is already up and
-nothing changes. That gap spun a cat on 2026-10-23. No robot command clears the flag without starting
+nothing changes. No robot command clears the flag without starting
 a cycle (the LR4 command set is cleanCycle, shortResetPress, power, night light, panel lock,
 brightness, clump time), so the robot alone cannot close it.
 
-The decision (2026-10-24): before every `drive_clean` and every stall `shortResetPress`, take a still
+Decision: before every `drive_clean` and every stall `shortResetPress`, take a still
 from a camera facing the box and have an LLM judge whether a cat is in or on it. If it sees a cat, or
 the camera cannot be reached, the watcher refuses. About 10–20 checks a day, so no model training is
 needed.
@@ -140,11 +138,10 @@ needed.
 - **Where the grab runs is open.** The watcher runs on Fly and the camera is on the home LAN, so Fly
   cannot reach it directly. Either something on the LAN (the Pi) grabs the still and serves it to the
   watcher, or the camera's RTSP is reached over a tunnel. Decide when building.
-- **To start building:** the camera's LAN address and the camera-account username and password, which
-  Jared supplies once it is set up.
+- **To start building:** the camera's LAN address and the camera-account username and password, supplied by the owner once it is set up.
 
 Still open and separate from the camera: the cat-held stuck alert body is values only, pending
-Jared's wording (`TODO(copy)` in `litter_watcher.py`), and an untested idea is whether a powerOff/
+final wording (`TODO(copy)` in `litter_watcher.py`), and an untested idea is whether a powerOff/
 powerOn clears `isCatDetectPending` without moving the globe — try it only with the flag up, the box
 empty and someone watching.
 

@@ -40,7 +40,7 @@ you add a gate.
 on a cycle looks like, and the scale gate there cannot see it (see below). The robot's
 `isCatDetectPending` rising during the stall is the only cat signal available, so it latches the
 episode hands-off. Do not drop that gate or shorten `STALL_CONFIRM_SECONDS` below the time the flag
-takes to rise (16s measured) — a 30s press restarted the globe on a cat on 2026-10-23.
+takes to rise (16s measured).
 `test_stall.py` pins it.
 
 ## The robot is held in Sleep Mode on purpose
@@ -72,8 +72,8 @@ A green deploy proves only that Fly accepted the release. The workflow then grep
 
 ## The Whisker API is unofficial and lies quietly
 
-`pylitterbot` is a reverse-engineered client, and `refresh()` has returned stale data with no error —
-the watcher was blind for a day. Hence the whole connection being recycled every `RECONNECT_EVERY_S`
+`pylitterbot` is a reverse-engineered client, and `refresh()` can return stale data with no error, which
+leaves the watcher blind. Hence the whole connection being recycled every `RECONNECT_EVERY_S`
 and a timeout on every call. Keep both when touching the connection path.
 
 Nothing in `robotStatus` reports a phantom weight; it stays `ROBOT_IDLE`. The light bar is the only
