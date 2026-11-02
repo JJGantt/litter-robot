@@ -93,8 +93,9 @@ Whisker's [light codes guide](https://www.litter-robot.com/support/article/litte
   zero. A healthchecks.io ping, fed once per connection cycle, catches a dead watcher.
 - **Reports to the ops responder** (health/responder). Every `*_error` event, and every failed write
   to `litter_events`, is reported there, and the polling loop beats once per pass, so a hung
-  `refresh()` goes quiet like a dead watcher. `ops_report.py` is a copy of health/responder's
-  reporter (edit it there); it needs the `OPS_TOKEN` Fly secret.
+  `refresh()` goes quiet like a dead watcher. The reporter is the `ops-report` package
+  (github.com/JJGantt/ops-report), pinned in `requirements.txt`; it needs the `OPS_TOKEN` and `OPS_URLS`
+  Fly secrets.
 - **Survives a half-open socket.** `refresh()` can return stale data with no error, so the whole Whisker connection is recycled
   every `RECONNECT_EVERY_S` and every call has a timeout.
 - **Publishes status** to Supabase `device_status` for the hub's litter card, on any change and

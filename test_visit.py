@@ -21,7 +21,8 @@ os.environ["LOG_DIR"] = tempfile.mkdtemp(prefix="visit-test-")
 
 for name, attrs in (("httpx", {"AsyncClient": object, "Timeout": object}),
                     ("dotenv", {"load_dotenv": lambda *a, **k: None}),
-                    ("pylitterbot", {"Account": object})):
+                    ("pylitterbot", {"Account": object}),
+                    ("ops_report", {n: (lambda *a, **k: None) for n in ("install", "report", "beat")})):
     mod = types.ModuleType(name)
     for k, v in attrs.items():
         setattr(mod, k, v)
