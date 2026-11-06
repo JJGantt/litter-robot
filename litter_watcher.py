@@ -250,20 +250,32 @@ async def _persist_event_async(rec: dict) -> None:
         "is_sleeping": rec.get("is_sleeping"), "online": rec.get("online"),
         "data": {k: v for k, v in rec.items() if k not in _CORE_KEYS} or None,
     }
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.post(
-                f"{SUPABASE_URL}/rest/v1/litter_events",
-                headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
-                         "Content-Type": "application/json", "Prefer": "return=minimal"},
-                json=row,
-            )
-            if r.status_code >= 300:   # raw print, NOT log_event, so a failure can't recurse
-                print(json.dumps({"ts": now_iso(), "event": "litter_events_error",
-                                  "code": r.status_code, "detail": r.text[:160]}), flush=True)
-                ops.report(f"litter_events_error: {r.status_code} {r.text[:160]}")
-    except Exception as ex:   # the mirror is best-effort and never disrupts the watcher, but it is reported
-        ops.report(f"litter_events_error: {ex}")
+    err = None
+    for attempt in range(2):   # one retry: a lost row is a gap in the visit history
+        if attempt:
+            await asyncio.sleep(5)
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.post(
+                    f"{SUPABASE_URL}/rest/v1/litter_events",
+                    headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                             "Content-Type": "application/json", "Prefer": "return=minimal"},
+                    json=row,
+                )
+            if r.status_code < 300:
+                return
+            err = f"{r.status_code} {r.text[:160]}"
+        except Exception as ex:   # best-effort mirror: never disrupts the watcher, but is reported
+            err = _ex_text(ex)
+    # raw print, NOT log_event, so a failure can't recurse
+    print(json.dumps({"ts": now_iso(), "event": "litter_events_error", "event_lost": row["event"],
+                      "detail": err}), flush=True)
+    ops.report(f"litter_events_error: {row['event']} row lost: {err}")
+
+
+def _ex_text(ex: Exception) -> str:
+    """httpx timeouts stringify to '', which made the reports unreadable; always name the type."""
+    return f"{type(ex).__name__}: {ex}" if str(ex) else type(ex).__name__
 
 
 def snapshot(robot) -> dict:
@@ -331,14 +343,16 @@ async def publish_row(row: dict) -> None:
         return
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(
+            r = await client.post(
                 f"{SUPABASE_URL}/rest/v1/device_status?on_conflict=device",
                 headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
                          "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates"},
                 json={**row, "updated_at": now_iso()},
             )
+        if r.status_code >= 300:
+            log_event("publish_error", error=f"{r.status_code} {r.text[:160]}")
     except Exception as ex:
-        log_event("publish_error", error=str(ex))
+        log_event("publish_error", error=_ex_text(ex))
 
 
 def _govee_ready() -> bool:
