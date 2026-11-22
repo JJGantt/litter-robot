@@ -1,4 +1,4 @@
 pylitterbot==2025.4.0
 python-dotenv>=1.0.0
 httpx>=0.27
-ops-report @ https://github.com/JJGantt/ops-report/archive/refs/tags/v1.1.0.tar.gz
+ops-report @ https://github.com/JJGantt/ops-report/archive/refs/tags/v1.2.0.tar.gz
