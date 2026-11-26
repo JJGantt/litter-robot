@@ -318,7 +318,7 @@ async def push_app(title: str, body: str, kind: str = "litter") -> None:
             if r.status_code != 200:
                 log_event("app_push_error", status=r.status_code, detail=r.text[:120])
     except Exception as ex:
-        log_event("app_push_error", error=str(ex))
+        log_event("app_push_error", error=_ex_text(ex))
 
 
 async def notify(title: str, body: str, kind: str = "litter") -> None:
@@ -334,7 +334,7 @@ async def heartbeat() -> None:
         async with httpx.AsyncClient(timeout=10) as client:
             await client.get(HEALTHCHECKS_URL)
     except Exception as ex:
-        log_event("heartbeat_error", error=str(ex))
+        log_event("heartbeat_error", error=_ex_text(ex))
 
 
 async def publish_row(row: dict) -> None:
@@ -398,8 +398,10 @@ async def load_diy_scenes() -> None:
         # repr, not str: an httpx timeout stringifies to "".
         if _DIY_SCENES:
             # This runs on every 10-min reconnect and the last good mapping is kept, so one slow
-            # Govee call changes nothing. A light that really cannot be driven reports light_error.
+            # Govee call changes nothing, so it is an occurrence (counted against its watch), not an
+            # error. A light that really cannot be driven reports light_error.
             log_event("diy_scenes_stale", error=repr(ex))
+            ops.occurrence(f"diy_scenes_stale: {ex!r}")
         else:
             log_event("diy_scenes_error", error=repr(ex))
         return
@@ -421,7 +423,7 @@ async def set_closet_light(scene: str) -> None:
         await _govee_ctrl("devices.capabilities.dynamic_scene", "diyScene", sid)
         log_event("light", scene=scene, id=sid)
     except Exception as ex:
-        log_event("light_error", error=str(ex), scene=scene)
+        log_event("light_error", error=_ex_text(ex), scene=scene)
 
 
 async def get_light_state() -> "dict | None":
@@ -446,7 +448,7 @@ async def get_light_state() -> "dict | None":
         return {"power": caps.get("powerSwitch"), "brightness": caps.get("brightness"),
                 "colorRgb": caps.get("colorRgb"), "colorTempK": caps.get("colorTemperatureK")}
     except Exception as ex:
-        log_event("light_read_error", error=str(ex))
+        log_event("light_read_error", error=_ex_text(ex))
         return None
 
 
@@ -469,7 +471,7 @@ async def apply_light_state(state: "dict | None") -> None:
         log_event("light_restored", brightness=state.get("brightness"),
                   colorTempK=state.get("colorTempK"), colorRgb=state.get("colorRgb"))
     except Exception as ex:
-        log_event("light_restore_error", error=str(ex))
+        log_event("light_restore_error", error=_ex_text(ex))
 
 
 class Watcher:
@@ -659,7 +661,7 @@ class Watcher:
                     if rows:
                         setattr(self, field, datetime.fromisoformat(rows[0]["ts"]).timestamp())
         except Exception as ex:
-            log_event("seed_error", error=str(ex))
+            log_event("seed_error", error=_ex_text(ex))
 
     async def publish_state(self, snap: dict, now: float) -> None:
         """Mirror robot + driver state to device_status: on any change, and at least every
@@ -734,7 +736,7 @@ class Watcher:
             try:
                 await self.robot.reset()
             except Exception as ex:
-                log_event("reset_error", error=str(ex))
+                log_event("reset_error", error=_ex_text(ex))
         if held >= STUCK_ALERT_SECONDS and (self.last_stuck_alert is None
                 or (now - self.last_stuck_alert) >= STUCK_REALERT_SECONDS):
             self.last_stuck_alert = now
@@ -814,7 +816,7 @@ class Watcher:
         try:
             await self.robot.reset()   # short reset press = zero the weight scale
         except Exception as ex:
-            log_event("scale_tare_error", error=str(ex))
+            log_event("scale_tare_error", error=_ex_text(ex))
 
         if self.scale_presses >= SCALE_ALERT_AFTER and not self.scale_alerted:
             # Reset is the manufacturer's own fix; if it will not take, the base is the suspect
@@ -893,7 +895,7 @@ class Watcher:
         try:
             await self.robot.reset()   # short reset on a parked globe: clears the latch; no press has started a cycle
         except Exception as ex:
-            log_event("lockout_reset_error", error=str(ex))
+            log_event("lockout_reset_error", error=_ex_text(ex))
 
         if self.lockout_presses >= LOCKOUT_ALERT_AFTER and not self.lockout_alerted:
             self.lockout_alerted = True
@@ -994,7 +996,7 @@ class Watcher:
             await self.robot.start_cleaning()
             self.dirty = False
         except Exception as ex:
-            log_event("drive_clean_error", error=str(ex))
+            log_event("drive_clean_error", error=_ex_text(ex))
 
     async def update_light(self, override: "str | None") -> None:
         """Take over the closet light to show `override`, or hand it back to the user.
@@ -1097,7 +1099,7 @@ async def run_once(watcher: "Watcher") -> None:
         try:
             await account.disconnect()
         except Exception as ex:
-            log_event("disconnect_error", error=str(ex))
+            log_event("disconnect_error", error=_ex_text(ex))
 
 
 # The gates that keep a cat from being spun can be made stricter from the environment, never looser
@@ -1127,7 +1129,7 @@ async def main() -> None:
         try:
             await run_once(watcher)
         except Exception as ex:
-            log_event("connection_error", error=str(ex))
+            log_event("connection_error", error=_ex_text(ex))
             await asyncio.sleep(10)  # backoff, then reconnect
 
 

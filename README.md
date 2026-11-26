@@ -92,7 +92,8 @@ Whisker's [light codes guide](https://www.litter-robot.com/support/article/litte
   goes unreachable, drops out of sleep mode, fills its drawer, or gets a scale it cannot
   zero. A healthchecks.io ping, fed once per connection cycle, catches a dead watcher.
 - **Reports to the ops responder** (health/responder). Every `*_error` event, and every failed write
-  to `litter_events`, is reported there, and the polling loop beats once per pass, so a hung
+  to `litter_events`, is reported there as an error (a stale DIY-scene reload, which keeps the last good
+mapping, as an occurrence), and the polling loop beats once per pass, so a hung
   `refresh()` goes quiet like a dead watcher. The reporter is the `ops-report` package
   (github.com/JJGantt/ops-report), pinned in `requirements.txt`; it needs the `OPS_TOKEN` and `OPS_URLS`
   Fly secrets.
